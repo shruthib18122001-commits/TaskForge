@@ -1,0 +1,91 @@
+{
+  "version": 3,
+  "cmakeMinimumRequired": { "major": 3, "minor": 16, "patch": 0 },
+  "configurePresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "generator": "Unix Makefiles",
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "cacheVariables": {
+        "TASKFORGE_BUILD_TESTS": "ON",
+        "TASKFORGE_BUILD_BENCH": "ON"
+      }
+    },
+    {
+      "name": "debug",
+      "inherits": "base",
+      "displayName": "Debug (no sanitizer)",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "TASKFORGE_SANITIZER": "none"
+      }
+    },
+    {
+      "name": "release",
+      "inherits": "base",
+      "displayName": "Release -O3",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "TASKFORGE_SANITIZER": "none"
+      }
+    },
+    {
+      "name": "asan",
+      "inherits": "base",
+      "displayName": "AddressSanitizer + UBSan",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "TASKFORGE_SANITIZER": "asan"
+      }
+    },
+    {
+      "name": "tsan",
+      "inherits": "base",
+      "displayName": "ThreadSanitizer",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "TASKFORGE_SANITIZER": "tsan"
+      }
+    },
+    {
+      "name": "ci",
+      "inherits": "debug",
+      "displayName": "CI Debug + warnings-as-errors",
+      "cacheVariables": { "TASKFORGE_WERROR": "ON" }
+    },
+    {
+      "name": "ci-asan",
+      "inherits": "asan",
+      "cacheVariables": { "TASKFORGE_WERROR": "ON" }
+    },
+    {
+      "name": "ci-tsan",
+      "inherits": "tsan",
+      "cacheVariables": { "TASKFORGE_WERROR": "ON" }
+    }
+  ],
+  "buildPresets": [
+    { "name": "debug",   "configurePreset": "debug" },
+    { "name": "release", "configurePreset": "release" },
+    { "name": "asan",    "configurePreset": "asan" },
+    { "name": "tsan",    "configurePreset": "tsan" },
+    { "name": "ci",      "configurePreset": "ci" },
+    { "name": "ci-asan", "configurePreset": "ci-asan" },
+    { "name": "ci-tsan", "configurePreset": "ci-tsan" }
+  ],
+  "testPresets": [
+    {
+      "name": "debug",
+      "configurePreset": "debug",
+      "output": { "outputOnFailure": true },
+      "execution": { "noTestsAction": "error", "stopOnFailure": false },
+      "filter": { "exclude": { "label": "buggy-demo" } }
+    },
+    { "name": "asan",    "inherits": "debug", "configurePreset": "asan" },
+    { "name": "tsan",    "inherits": "debug", "configurePreset": "tsan" },
+    { "name": "ci",      "inherits": "debug", "configurePreset": "ci" },
+    { "name": "ci-asan", "inherits": "debug", "configurePreset": "ci-asan" },
+    { "name": "ci-tsan", "inherits": "debug", "configurePreset": "ci-tsan" }
+  ]
+}
