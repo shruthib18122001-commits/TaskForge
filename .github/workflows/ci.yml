@@ -127,10 +127,11 @@ jobs:
       - run: pip install -r scripts/requirements.txt
       - name: Compile-check
         run: python -m py_compile scripts/*.py
-      - name: Smoke-run plotters on sample data
+      - name: Smoke-run plotters + analyzer on sample data
         run: |
           mkdir -p results/charts
-          python scripts/plot_scaling.py     --csv results/csv/sample_scaling.csv     --out results/charts/_ci_scaling.png
-          python scripts/plot_granularity.py --csv results/csv/sample_granularity.csv --out results/charts/_ci_gran.png
-          python scripts/plot_steal_rate.py  --csv results/csv/sample_steal_rate.csv  --out results/charts/_ci_steal.png
+          python scripts/plot_scaling.py      --csv results/csv/sample_scaling.csv      --out results/charts/_ci_scaling.png
+          python scripts/plot_granularity.py  --csv results/csv/sample_granularity.csv  --out results/charts/_ci_gran.png
+          python scripts/plot_steal_rate.py   --csv results/csv/sample_steal_rate.csv   --out results/charts/_ci_steal.png
           python scripts/plot_false_sharing.py --csv results/csv/sample_false_sharing.csv --out results/charts/_ci_fs.png
+          python scripts/analyze.py --csv results/csv/sample_scaling.csv --perf-dir /nonexistent --out results/perf/_ci_analysis.md

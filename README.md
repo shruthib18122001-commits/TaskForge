@@ -55,12 +55,12 @@ Full rationale, and every atomic memory-ordering decision, is in
 | `include/taskforge/mutex_queue_pool.hpp` | baseline: one global mutex + `std::queue` |
 | `include/taskforge/async_pool.hpp` | baseline: `std::async` per task |
 | `include/taskforge/dag.hpp` | DAG resolver + cycle detection |
-| `include/taskforge/steal_stats.hpp` | Stage 7: per-worker steal instrumentation |
-| `include/taskforge/worker_storage.hpp` | Stage 8: packed vs `alignas(64)` worker state |
+| `include/taskforge/false_sharing.hpp` | Stage 8: packed vs `alignas(64)` counter harness |
+| (Stage 7 per-worker counters live in `thread_pool.hpp` — `WorkerCounters` / `stats()`) | |
 | `tests/` | GoogleTest suite (built by CMake) |
 | `verify/` | framework-free assert-based checks (built by the Makefile) |
 | `bench/` | benchmark harness, emits CSV |
-| `scripts/` | Python plotters + `perf` wrappers |
+| `scripts/` | Python plotters, `perf` wrapper, scaling-limit analyzer |
 | `results/csv,charts,perf/` | generated data (git-ignored; `sample_*.csv` committed) |
 
 ---
@@ -110,8 +110,9 @@ scripts/run_all.sh
 build/*/bench/taskforge_bench --bench scaling    --pool all --task-us 8 --out results/csv/scaling.csv
 build/*/bench/taskforge_bench --bench granularity --pool all --out results/csv/granularity.csv
 
-# perf-instrumented runs (Linux) -> results/perf/*.txt + results/csv/perf_*.csv
+# perf-instrumented scaling run (Linux): one perf-stat per thread count
 scripts/run_perf.sh scaling
+python scripts/analyze.py           # joins perf counters with the curve -> results/perf/scaling_analysis.md
 
 # Regenerate every figure from the CSVs
 python scripts/plot_scaling.py       --csv results/csv/scaling.csv       --out results/charts/scaling.png
@@ -132,10 +133,21 @@ plotters.
 
 ### Scaling (threads 1 → hardware_concurrency)
 
-<!-- MEASURE: paste results/charts/scaling.png and the table -->
-_Scaling is linear to ~<!-- MEASURE -->N threads, then departs because
-<!-- MEASURE: bandwidth / coherence traffic / steal-path contention -->; see
-[scaling-limit analysis](#scaling-limit-analysis)._
+<!-- MEASURE: paste results/charts/scaling.png and the table from scripts/analyze.py -->
+On the dev box (Apple M5, 10 cores, 8µs tasks) the work-stealing pool reached
+~6.4× at 10 threads with efficiency crossing 0.8 at ~6 threads — the knee. The
+mutex-queue baseline tracked it within a few percent for this flat,
+externally-fed workload (see the note below); `std::async` did not scale at all.
+Reference-machine numbers and the `perf`-backed cause go in
+[scaling-limit analysis](#scaling-limit-analysis).
+
+> **Why the mutex baseline keeps up here.** A single external producer feeding
+> N independent tasks sends every one of them through the *injection queue* — a
+> mutex-guarded global queue — because Chase–Lev forbids a second writer on a
+> worker's deque. So this workload never really exercises the deques. The
+> work-stealing advantage shows up when tasks live on worker deques: recursive
+> fork–join, and imbalanced loads. The granularity and steal-rate sweeps below
+> use those.
 
 ### Task-granularity sweep — the key experiment
 
@@ -143,17 +155,24 @@ _Scaling is linear to ~<!-- MEASURE -->N threads, then departs because
 Work stealing wins by <!-- MEASURE -->× on <!-- MEASURE -->µs tasks and
 converges to parity with the mutex-queue baseline at a per-task size of about
 **<!-- MEASURE --> µs** — the crossover. Above that, scheduling overhead is lost
-in the task itself and the deque buys nothing. The honest curve, not the single
+in the task itself and the deque buys nothing. `std::async` is <!-- MEASURE -->×
+slower on the fine end (a thread per task). The honest curve, not the single
 fine-grained ratio, is the point.
 
 ### Imbalanced workload
 
-<!-- MEASURE --> — stealing's best case; speedup vs both baselines.
+<!-- MEASURE: uniform vs mixed vs heavy-tailed, same total work; speedup vs both
+baselines. Heavy-tailed is where stealing should look best. -->
 
 ### Steal-rate instrumentation (Stage 7)
 
-<!-- MEASURE: paste results/charts/steal_rate.png --> — successful steals, failed
-steals, and spin time per worker, plotted against load imbalance.
+<!-- MEASURE: paste results/charts/steal_rate.png -->
+The steal-rate sweep seeds every task onto one worker's deque and lets the rest
+steal, sweeping the leaf-duration imbalance factor. The signal: as imbalance
+rises, total worker idle time (summed condvar sleep, `sleep_ns`) rises
+monotonically — the load stealing could *not* hide — and the per-worker steal
+counts skew (light-task grabbers come back for more). Invariant checked by the
+tests: `own_pops + steals_success + inject_takes == tasks_executed` per worker.
 
 ### False-sharing experiment (Stage 8)
 
@@ -194,30 +213,63 @@ slots are widened to a two-word cell so the effect is easy to see.
 | ThreadSanitizer (Apple M5) | detects it, but the arm64 sanitizer runtime deadlocks its own report path under concurrent races — see "what didn't work"; the Linux CI job is authoritative |
 
 Run it: `make buggy-demo`. CI job `buggy-ordering-demo` fails if the variant ever
-comes back clean. Full diff and the memory-model argument: [DESIGN.md](DESIGN.md#stage-9-the-deliberately-wrong-ordering).
+comes back clean. Full diff and the memory-model argument: [DESIGN.md](DESIGN.md#10-stage-9-the-deliberately-wrong-ordering).
 
 ### Scaling-limit analysis
 
-<!-- MEASURE: correlate the scaling knee with perf counters — IPC drop,
-cache-miss rate, context-switch / cpu-migration counts — one paragraph per
-candidate cause, with the number that rules it in or out. -->
+`scripts/run_perf.sh scaling` captures one `perf stat` per thread count;
+`scripts/analyze.py` joins those with the curve and emits
+`results/perf/scaling_analysis.md` — a table of throughput / speedup /
+efficiency / IPC / cache-miss-rate / context-switches / cpu-migrations per
+thread count, and it points at the knee.
+
+<!-- MEASURE: paste the analyze.py table, then one paragraph per candidate
+cause with the number that rules it in or out:
+  * falling IPC + rising cache-miss rate      -> memory bandwidth / coherence
+  * flat IPC + rising ctx-switches/migrations -> scheduler overhead / oversubscription
+  * flat IPC + flat cache + rising steal aborts (from --bench steal-rate) -> steal-path contention
+  * none of the above moving                  -> genuine serial fraction (Amdahl)
+On the M5 the knee at ~6 threads coincides with the 4 performance + 6 efficiency
+core split; confirm on the homogeneous Linux box, where the knee should move. -->
+
+The Apple M5 is heterogeneous (performance + efficiency cores), so its knee is
+partly a core-type artefact. The Linux reference box is homogeneous and is the
+one the analysis should conclude from.
 
 ---
 
 ## Comparison to production schedulers
 
-Positioning, not a claim of parity:
+Positioning, not a claim of parity. What each does that TaskForge doesn't, and
+why it matters:
 
-- **Intel TBB** — task arenas, range partitioners, a `flow::graph` that is a
-  superset of this DAG resolver, and NUMA-aware `task_arena`. TaskForge has one
-  global thread set and no partitioners.
-- **Go runtime scheduler** — G/M/P model, per-P run queues with work stealing
-  (this deque is the same idea), plus preemption, a netpoller, and integration
-  with the GC. TaskForge tasks run to completion and cannot be preempted.
-- **Java `ForkJoinPool`** — Chase–Lev-style deques, continuation stealing,
-  `ManagedBlocker` for blocking tasks, `CountedCompleter` for DAGs. TaskForge
-  does child stealing (not continuation stealing) and has no managed-blocking
-  escape hatch.
+- **Intel TBB / oneTBB** — `task_arena` + `task_group`, range **partitioners**
+  (`auto_partitioner` splits a range adaptively to the steal rate, so you don't
+  hand-pick a grain), a `flow::graph` that is a strict superset of this DAG
+  resolver (nodes with typed edges, buffering, back-pressure), and NUMA-aware
+  arenas pinned to core sets. TaskForge has one global worker set, a fixed grain
+  chosen by the caller, and a DAG that only carries control dependencies.
+- **Go runtime scheduler** — G/M/P model: goroutines (G) multiplexed onto OS
+  threads (M) via logical processors (P), each P with a 256-slot local run queue
+  that other Ps steal from (the same idea as this deque) plus a global queue.
+  Beyond scheduling: asynchronous **preemption** (a goroutine can be stopped
+  mid-loop), a **netpoller** that parks goroutines blocked on I/O without
+  burning an M, hand-off of the P when an M blocks in a syscall, and tight GC
+  integration. TaskForge tasks run to completion, can't be preempted, and a task
+  that blocks burns its worker.
+- **Java `ForkJoinPool`** — Chase–Lev deques, but **continuation stealing**:
+  `fork()` pushes the *continuation* and keeps running the child, so a stealer
+  picks up the parent's remainder; this bounds stack depth better than the
+  child-stealing + `help_until` here. Plus `ManagedBlocker` (tell the pool "I'm
+  about to block, spin up a compensation thread"), `CountedCompleter` for
+  push-style DAG completion, and a common pool sized to the machine. TaskForge
+  does child stealing, has no managed-blocking escape hatch, and `help_until`
+  keeps the waiting frame on the stack.
+
+Common thread: the production schedulers all invest heavily in **what happens
+when a task blocks or runs long** (preemption, compensation threads, I/O
+parking). TaskForge deliberately doesn't — it targets CPU-bound run-to-completion
+tasks, and says so.
 
 ---
 
@@ -246,10 +298,24 @@ Kept as we went; failed experiments are the most credible part of this.
   keeping sanitized stress harnesses to 1–2 racing threads locally and treating
   the **Linux x86-64 CI** sanitizer jobs as authoritative. Not a bug in
   TaskForge, but it shaped how the tests are written.
-- <!-- MEASURE / fill from the log as later stages land: e.g. "round-robin
-  victim selection raised failed-steal rate under skew — switched to random" -->
-- <!-- MEASURE: "immediate CV block on empty deque added ~Nµs wake latency to
-  fork–join recursion — added a spin phase before blocking" -->
+- **The flat-workload benchmark didn't test what it looked like it tested.** The
+  first scaling/granularity sweeps submit N independent tasks from the main
+  thread. Building the Stage 7 steal-rate instrumentation made it obvious that
+  every one of those tasks goes through the injection queue (single-owner rule),
+  so `steals_success` was ~0 and the work-stealing pool was, for that workload,
+  a mutex queue with extra failed steal attempts. The deque only earns its keep
+  when work originates *on* worker deques — recursive fork–join and imbalance.
+  The steal-rate and DAG sweeps were rebuilt around that; the flat sweeps stayed
+  as an honest "here's where it doesn't help" data point.
+- **`std::function` per task is a measurable floor.** On sub-microsecond tasks
+  the `new Task{std::function}` allocation is a real fraction of per-task cost,
+  and it's paid by every pool (the mutex baseline `new`s a `Task` too), which is
+  part of why work-stealing ≈ mutex-queue at the fine end for flat workloads. A
+  small-buffer callable would lift that floor; it's applied uniformly across
+  pools so the *comparison* stays fair, and left as future work.
+- <!-- MEASURE: fill from the reference-machine runs, e.g. spin/yield/sleep
+  backoff constants — the current 128/64/500µs were picked, not measured -->
+- <!-- MEASURE: TF_CACHELINE 64 vs 128 on Apple Silicon (Stage 8) -->
 
 ---
 

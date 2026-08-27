@@ -72,6 +72,7 @@ $(D_ASAN)/%: verify/%.cpp | dirs
 verify: $(VERIFY_DEBUG)
 	@echo "=== running verify/ (no sanitizer) ==="; \
 	rc=0; for b in $(VERIFY_DEBUG); do \
+	  case "$$b" in *verify_buggy_deque) echo "--- $$b (SKIPPED; it is SUPPOSED to fail -- see 'make buggy-demo')"; continue;; esac; \
 	  echo "--- $$b"; "$$b" || rc=$$?; \
 	done; \
 	if [ $$rc -eq 0 ]; then echo "ALL VERIFY OK"; else echo "VERIFY FAILURES (rc=$$rc)"; fi; \
