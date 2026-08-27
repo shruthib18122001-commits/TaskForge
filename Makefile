@@ -30,6 +30,9 @@ INCLUDES := -Iinclude
 
 TSAN_FLAGS := -fsanitize=thread -fno-omit-frame-pointer -g -O1 -pthread
 ASAN_FLAGS := -fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer -g -O1 -pthread
+# LeakSanitizer is Linux-only; on macOS ASan just prints a note. CI (Linux)
+# sets detect_leaks=1 via the workflow env.
+ASAN_RUN_OPTS :=
 
 BUILD    := build
 D_DEBUG  := $(BUILD)/debug
@@ -87,7 +90,7 @@ verify-asan: $(VERIFY_ASAN)
 	@echo "=== running verify/ under AddressSanitizer + UBSan ==="; \
 	rc=0; for b in $(VERIFY_ASAN); do \
 	  case "$$b" in *verify_buggy_deque) echo "--- $$b (SKIPPED here)"; continue;; esac; \
-	  echo "--- $$b"; ASAN_OPTIONS="detect_leaks=1" "$$b" || rc=$$?; \
+	  echo "--- $$b"; ASAN_OPTIONS="$(ASAN_RUN_OPTS)" "$$b" || rc=$$?; \
 	done; \
 	if [ $$rc -eq 0 ]; then echo "ALL VERIFY-ASAN OK"; else echo "VERIFY-ASAN FAILURES (rc=$$rc)"; fi; \
 	exit $$rc
