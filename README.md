@@ -103,18 +103,28 @@ Reference machines:
   where relaxed-ordering bugs surface.
 
 ```sh
-# Full benchmark matrix -> results/csv/*.csv
+# Full benchmark matrix -> results/csv/*.csv  (granularity, scaling, imbalanced, dag)
 scripts/run_all.sh
 
-# perf-instrumented runs (Linux) -> results/perf/*.txt
+# Or one sweep at a time (see bench_main.cpp for all options):
+build/*/bench/taskforge_bench --bench scaling    --pool all --task-us 8 --out results/csv/scaling.csv
+build/*/bench/taskforge_bench --bench granularity --pool all --out results/csv/granularity.csv
+
+# perf-instrumented runs (Linux) -> results/perf/*.txt + results/csv/perf_*.csv
 scripts/run_perf.sh scaling
 
 # Regenerate every figure from the CSVs
-python scripts/plot_scaling.py      --csv results/csv/scaling.csv      --out results/charts/scaling.png
-python scripts/plot_granularity.py  --csv results/csv/granularity.csv  --out results/charts/granularity.png
-python scripts/plot_steal_rate.py   --csv results/csv/steal_rate.csv   --out results/charts/steal_rate.png
+python scripts/plot_scaling.py       --csv results/csv/scaling.csv       --out results/charts/scaling.png
+python scripts/plot_granularity.py   --csv results/csv/granularity.csv   --out results/charts/granularity.png
+python scripts/plot_steal_rate.py    --csv results/csv/steal_rate.csv    --out results/charts/steal_rate.png
 python scripts/plot_false_sharing.py --csv results/csv/false_sharing.csv --out results/charts/false_sharing.png
 ```
+
+Every sweep shares one CSV schema (`bench,pool,threads,workload,task_us,n_tasks,
+reps,median_ms,…,throughput_tasks_per_s,iters_per_us,pinned`); rows concatenate.
+`iters_per_us` is the busy-wait calibration for that run — recorded so a reader
+can judge it. `results/csv/sample_*.csv` are committed so CI can smoke-test the
+plotters.
 
 ---
 

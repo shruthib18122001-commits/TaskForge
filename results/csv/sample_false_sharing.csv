@@ -1,0 +1,13 @@
+bench,pool,layout,threads,workload,n_tasks,reps,median_ms,throughput_tasks_per_s,cache_misses
+false-sharing,workstealing,packed,1,counter-hammer,2000000,10,1063.8298,1880000.0,1500000
+false-sharing,workstealing,aligned,1,counter-hammer,2000000,10,1015.2284,1970000.0,1050000
+false-sharing,workstealing,packed,2,counter-hammer,2000000,10,568.1818,3520000.0,4000000
+false-sharing,workstealing,aligned,2,counter-hammer,2000000,10,515.4639,3880000.0,2100000
+false-sharing,workstealing,packed,4,counter-hammer,2000000,10,328.9474,6080000.0,12000000
+false-sharing,workstealing,aligned,4,counter-hammer,2000000,10,265.9574,7520000.0,4200000
+false-sharing,workstealing,packed,6,counter-hammer,2000000,10,260.4167,7680000.0,24000000
+false-sharing,workstealing,aligned,6,counter-hammer,2000000,10,183.1502,10920000.0,6300000
+false-sharing,workstealing,packed,8,counter-hammer,2000000,10,240.3846,8320000.0,40000000
+false-sharing,workstealing,aligned,8,counter-hammer,2000000,10,142.0455,14080000.0,8400000
+false-sharing,workstealing,packed,10,counter-hammer,2000000,10,200.0,10000000.0,60000000
+false-sharing,workstealing,aligned,10,counter-hammer,2000000,10,117.6471,17000000.0,10500000
