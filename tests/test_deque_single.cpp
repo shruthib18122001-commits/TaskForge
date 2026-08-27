@@ -49,7 +49,7 @@ TEST(DequeSingle, ThiefSeesOldestFirst) {
   for (int i = 0; i < 20; ++i) d.push(i);
 
   for (int i = 0; i < 12; ++i) {
-    std::int64_t out = -1;
+    int out = -1;
     ASSERT_EQ(d.steal(out), StealStatus::kSuccess);
     EXPECT_EQ(out, i);
   }
@@ -69,13 +69,13 @@ TEST(DequeSingle, LastElementGoesToExactlyOneCaller) {
     auto v = d.pop();
     ASSERT_TRUE(v.has_value());
     EXPECT_EQ(*v, 7);
-    std::int64_t out = -1;
+    int out = -1;
     EXPECT_EQ(d.steal(out), StealStatus::kEmpty);
   }
   {
     ChaseLevDeque<int> d(64);
     d.push(7);
-    std::int64_t out = -1;
+    int out = -1;
     ASSERT_EQ(d.steal(out), StealStatus::kSuccess);
     EXPECT_EQ(out, 7);
     EXPECT_FALSE(d.pop().has_value());

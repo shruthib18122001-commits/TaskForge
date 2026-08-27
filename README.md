@@ -193,8 +193,21 @@ Positioning, not a claim of parity:
 
 Kept as we went; failed experiments are the most credible part of this.
 
-- <!-- MEASURE / fill from the log as stages land: e.g. "round-robin victim
-  selection raised failed-steal rate under skew — switched to random" -->
+- **Standalone `std::atomic_thread_fence` (the textbook LPCN formulation).** The
+  deque first followed LPCN literally: a `release` fence in `push()` and
+  `seq_cst` fences separating the owner's and thief's last-element accesses.
+  It was correct on hardware and TSan-clean *in isolation* (single owner, single
+  thief). Under the pool's workload — every thread rapidly alternating owner
+  ops on its own deque and thief ops on others — **ThreadSanitizer on arm64
+  deadlocked inside its own runtime**. TSan's modelling of standalone fences is
+  a documented weak spot. Switched to carrying the orderings on the operations
+  themselves: a `release` store on `bottom_` in `push()`, and `seq_cst` on the
+  `bottom_`/`top_` accesses that form the Dekker pair. Provably equivalent (the
+  argument is a single total order over the seq_cst ops), it is what
+  crossbeam-deque / Taskflow-style implementations do in practice, and it is
+  TSan-clean. Details in [DESIGN.md](DESIGN.md).
+- <!-- MEASURE / fill from the log as later stages land: e.g. "round-robin
+  victim selection raised failed-steal rate under skew — switched to random" -->
 - <!-- MEASURE: "immediate CV block on empty deque added ~Nµs wake latency to
   fork–join recursion — added a spin phase before blocking" -->
 

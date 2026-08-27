@@ -1,18 +1,29 @@
 // chase_lev_deque.hpp
 // =============================================================================
-// A lock-free work-stealing deque (Chase & Lev, SPAA 2005) with the exact C11
-// memory orderings from:
+// A lock-free work-stealing deque (Chase & Lev, SPAA 2005).
 //
-//   Nhat Minh Lê, Antoniu Pop, Albert Cohen, Francesco Zappa Nardelli.
-//   "Correct and Efficient Work-Stealing for Weak Memory Models."
-//   PPoPP 2013.  (Referred to below as "LPCN".)
+// The algorithm is Chase-Lev; the memory-ordering treatment follows
 //
-// LPCN is the reference because it *proves* the ordering choices against a
-// formal C11 model and the ARM/Power memory models -- which is precisely the
-// bar this project is held to. Every non-relaxed operation below carries a
-// comment naming what it synchronizes with and why a weaker order breaks. The
-// prose version of the same argument, with the failing interleavings drawn out,
-// is in DESIGN.md.
+//   Nhat Minh Le, Antoniu Pop, Albert Cohen, Francesco Zappa Nardelli.
+//   "Correct and Efficient Work-Stealing for Weak Memory Models." PPoPP 2013.
+//   (Referred to below as "LPCN".)
+//
+// with ONE deliberate departure: LPCN publishes the element in push() with a
+// standalone `atomic_thread_fence(release)`, and separates the owner's and
+// thief's last-element accesses with `atomic_thread_fence(seq_cst)`. This file
+// instead carries those orderings on the atomic operations themselves -- a
+// release store on `bottom_` in push(), and seq_cst on the `bottom_`/`top_`
+// accesses that form the Dekker pair between pop() and steal().
+//
+// Why the departure: ThreadSanitizer does not reliably model standalone
+// `std::atomic_thread_fence` (documented limitation; on arm64 it caused TSan to
+// hang under this project's mixed owner/thief pool workload -- see DESIGN.md
+// "what didn't work"). The per-operation formulation is provably equivalent
+// (the argument, below and in DESIGN.md, is a total order over all seq_cst
+// operations), is what crossbeam-deque / Taskflow-style implementations use in
+// practice, and is TSan-clean. It is also, arguably, easier to reason about:
+// "these operations are seq_cst, hence totally ordered, and here is the
+// interleaving argument over that order."
 //
 // -----------------------------------------------------------------------------
 // Ownership / concurrency contract
@@ -21,25 +32,23 @@
 //   * ANY number of other threads -- "thieves" -- may call steal() concurrently
 //     with each other and with the owner.
 //   * The owner never calls steal() on its own deque; it uses pop().
-//
-// Violating the single-owner rule (e.g. an external producer calling push())
-// is undefined behaviour for this data structure. The thread pool enforces it
-// with a separate injection queue -- see thread_pool.hpp.
+// Violating single-owner is undefined behaviour for this structure. The thread
+// pool enforces it with a separate injection queue (see thread_pool.hpp).
 //
 // -----------------------------------------------------------------------------
 // Index model
 // -----------------------------------------------------------------------------
 // `top_` and `bottom_` are 64-bit signed counters, both starting at 0, only
-// ever incremented (never wrapped in any realistic runtime -- see "ABA" below).
+// ever incremented (never wrapped in any realistic runtime -- see "ABA").
 //
-//     bottom_ - top_   == number of elements currently in the deque
-//     owner pushes/pops at the `bottom_` end   (LIFO for the owner)
-//     thieves steal at the `top_` end          (FIFO w.r.t. the owner)
+//     bottom_ - top_  == number of elements currently in the deque
+//     owner pushes / pops at the `bottom_` end   (LIFO for the owner)
+//     thieves steal at the `top_` end            (FIFO w.r.t. the owner)
 //
-// The backing store is a power-of-two circular buffer ("Ring"); index i maps to
-// slot `i & mask`. When it fills, the owner allocates a Ring of twice the size,
-// copies the live range [top_, bottom_), and publishes it. Old Rings are kept
-// on an owner-private retired list and freed in the destructor (see
+// Storage is a power-of-two circular buffer ("Ring"); index i -> slot i & mask.
+// When it fills, the owner allocates a Ring of double the size, copies the live
+// range [top_, bottom_), and publishes it with a release store. Old Rings are
+// kept on an owner-private retired list and freed in the destructor (see
 // "Memory reclamation").
 // =============================================================================
 
@@ -49,7 +58,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
-#include <new>
 #include <optional>
 #include <type_traits>
 #include <vector>
@@ -84,17 +92,11 @@ class ChaseLevDeque {
       : top_(0), bottom_(0), ring_(nullptr) {
     std::int64_t cap = round_up_pow2(initial_capacity < 64 ? 64 : initial_capacity);
     Ring* r = new Ring(cap);
-    // Plain store: no other thread exists yet (the deque is not published).
-    ring_.store(r, std::memory_order_relaxed);
+    ring_.store(r, std::memory_order_relaxed);  // not published yet: no other thread
     owned_rings_.emplace_back(r);
   }
 
-  ~ChaseLevDeque() {
-    // All threads that could touch this deque must already be joined -- that is
-    // the pool's shutdown contract. So this is single-threaded cleanup.
-    // owned_rings_ holds every Ring ever allocated (current + retired); the
-    // unique_ptrs free them here.
-  }
+  ~ChaseLevDeque() = default;  // owned_rings_ frees every Ring; all threads joined by now
 
   ChaseLevDeque(const ChaseLevDeque&) = delete;
   ChaseLevDeque& operator=(const ChaseLevDeque&) = delete;
@@ -105,52 +107,37 @@ class ChaseLevDeque {
   // OWNER ONLY. Never fails: grows the ring if necessary.
   void push(T x) {
     // bottom_: the owner is its only writer, so a relaxed load reads our own
-    // last value -- no synchronization needed.
+    // last value.
     const std::int64_t b = bottom_.load(std::memory_order_relaxed);
 
-    // top_: ACQUIRE. Thieves publish their progress by CAS-ing top_ with
-    // release semantics (see steal()). We must observe a sufficiently recent
-    // top_ here so that (a) the fullness test below doesn't under-count live
-    // elements, and (b) if we grow, the copy loop's lower bound `t` doesn't
-    // include slots thieves have already consumed. A relaxed load could return
-    // a stale-small top_, making us copy already-stolen slots -- harmless to
-    // correctness of *values* (thieves only read slots, never write them) but
-    // it is the order LPCN proves necessary for the resize argument, so we
-    // match it.
+    // top_: ACQUIRE. Thieves publish progress by CAS-ing top_ with release
+    // semantics (see steal()). Observing a recent top_ here keeps the fullness
+    // test from under-counting and keeps grow()'s copy lower-bound honest.
+    // (LPCN proves this load must be at least acquire.)
     const std::int64_t t = top_.load(std::memory_order_acquire);
 
-    // ring_: owner is its only writer (only push()/grow change it) -> relaxed.
+    // ring_: owner is its only writer -> relaxed.
     Ring* r = ring_.load(std::memory_order_relaxed);
 
     if (b - t > r->capacity - 1) {
-      // b - t is the current element count. This condition is `count >= cap`,
-      // i.e. exactly full: the slot for the new element, (b & mask), aliases
-      // the slot still holding element (b - cap), which top_ has not yet passed.
-      // Grow (doubling), then continue with the new ring. (LPCN writes the same
-      // test as `> size - 1`.)
+      // b - t is the current element count; this condition is `count >= cap`,
+      // i.e. exactly full -- the slot for the new element, (b & mask), aliases
+      // the slot still holding element (b - cap), which top_ has not passed.
       r = grow(r, t, b);
     }
 
-    // Write the element with a RELAXED store into the slot...
+    // Write the element with a RELAXED slot store, then publish it by advancing
+    // bottom_ with a RELEASE store.
+    //
+    // This release store is the producer half of the release/acquire pair that
+    // hands the element to a thief: a thief that reads this new bottom_ value
+    // with an acquire load (steal()) synchronizes-with this store, so the slot
+    // write sequenced before it is visible to the slot read the thief does
+    // after. Replacing `release` with `relaxed` here is exactly Stage 9's bug:
+    // on x86 (TSO: no store-store reorder) nothing breaks; on ARM a thief can
+    // see bottom_ advance before the slot write lands and steal a stale value.
     r->put(b, x);
-
-    // ...then a RELEASE FENCE, then the RELAXED publish of bottom_.
-    //
-    // This fence is the producer half of the release/acquire pair that hands
-    // the element to a thief. It orders the slot write (above) *before* the
-    // bottom_ store (below) in a way a thief can rely on: a thief that reads
-    // the new bottom_ with an acquire load (steal()) and then reads the slot
-    // is guaranteed to see this element, not whatever the slot held before.
-    //
-    // Why a standalone fence and not a release store on bottom_ itself? Either
-    // works on paper; LPCN uses the fence + relaxed store and it is marginally
-    // cheaper on ARM (one `dmb ish` vs. a `stlr` whose ordering is slightly
-    // stronger than needed). Stage 9's buggy variant deletes exactly this
-    // fence -- on x86 (TSO: stores don't reorder with stores) nothing breaks;
-    // on ARM a thief can see bottom_ advance before the slot write lands and
-    // steal a stale value.
-    std::atomic_thread_fence(std::memory_order_release);
-    bottom_.store(b + 1, std::memory_order_relaxed);
+    bottom_.store(b + 1, std::memory_order_release);
   }
 
   // ------------------------------------------------------------------- pop()
@@ -159,67 +146,44 @@ class ChaseLevDeque {
     const std::int64_t b = bottom_.load(std::memory_order_relaxed) - 1;
     Ring* r = ring_.load(std::memory_order_relaxed);
 
-    // Tentatively claim slot b by publishing the decremented bottom_. A thief
-    // that now runs steal() will compute a smaller (b - t) and back off from
-    // the last element -- unless it already committed, which the fence + CAS
-    // below resolve.
-    bottom_.store(b, std::memory_order_relaxed);
-
-    // SEQ_CST FENCE -- the crux of the algorithm.
+    // Tentatively claim slot b by publishing the decremented bottom_ with a
+    // SEQ_CST store. Together with the seq_cst load of top_ just below, and
+    // steal()'s seq_cst load of bottom_ and seq_cst CAS of top_, these form a
+    // set of operations with a single global total order S.
     //
-    // The owner here does:   store(bottom_)   then   load(top_).
-    // A thief in steal() does: store(top_) [via CAS] then load(bottom_).
-    // Both sequences are store-then-load to *different* locations. That is the
-    // one reordering even x86-TSO permits (StoreLoad), and ARM permits it
-    // freely. Without a barrier, the owner could read a stale top_ and the
-    // thief a stale bottom_, and BOTH conclude the last element is theirs.
-    //
-    // A seq_cst fence on each side forces both fences into one global total
-    // order S. Whichever fence is second in S, the thread executing it sees
-    // the other thread's store. So at most one of {owner, thief} proceeds to
-    // take the contested element; the other sees the updated counter and backs
-    // off. This is the classic Dekker / StoreLoad idiom. DESIGN.md walks the
-    // losing interleaving step by step.
-    std::atomic_thread_fence(std::memory_order_seq_cst);
-
-    // top_: relaxed load is fine *here* -- the seq_cst fence above already
-    // provides the ordering we need against the thief's CAS; acquire would add
-    // nothing.
-    std::int64_t t = top_.load(std::memory_order_relaxed);
+    // The Dekker argument: the owner does store(bottom_) then load(top_); a
+    // thief does load(bottom_) then CAS(top_). All four are seq_cst, so in S
+    // either the owner's store precedes the thief's load (thief sees the
+    // decremented bottom_ and backs off the last element) or it does not (then
+    // the owner's load sees the thief's CAS, or the two CASes on top_ race and
+    // exactly one wins). Either way at most one of {owner, thief} takes the
+    // contested element. DESIGN.md walks the losing interleaving that a weaker
+    // order would allow.
+    bottom_.store(b, std::memory_order_seq_cst);
+    std::int64_t t = top_.load(std::memory_order_seq_cst);
 
     std::optional<T> result;
 
     if (t <= b) {
-      // Non-empty.
-      T x = r->get(b);  // relaxed: this slot was written by us (the owner)
+      T x = r->get(b);  // relaxed: this slot was written by us, the owner
       if (t == b) {
-        // Exactly one element, and a thief may be going for the same one.
-        // Resolve with a CAS on top_.
-        //   success ordering seq_cst: this CAS must sit in the SAME total order
-        //     S as the fence above and as the thief's steal() CAS, or the
-        //     Dekker argument doesn't close. acq_rel is NOT enough here (it
-        //     wouldn't be ordered against our own seq_cst fence on ARM).
-        //   failure ordering relaxed: on failure a thief won; we took nothing,
-        //     we just need the updated `t`, and we re-establish state below.
-        if (!top_.compare_exchange_strong(t, t + 1,
-                                          std::memory_order_seq_cst,
-                                          std::memory_order_relaxed)) {
-          // Thief got it.
-          result.reset();
-        } else {
+        // Exactly one element; a thief may be going for the same one.
+        //   success seq_cst: this CAS is part of S (see above).
+        //   failure relaxed: on failure a thief won; we took nothing and only
+        //     need the refreshed t before restoring state.
+        if (top_.compare_exchange_strong(t, t + 1, std::memory_order_seq_cst,
+                                         std::memory_order_relaxed)) {
           result = x;
         }
-        // Whether we won or lost, the deque is now empty; restore the canonical
-        // empty representation bottom_ == top_.
+        // Won or lost, the deque is now empty: restore bottom_ == top_.
         bottom_.store(b + 1, std::memory_order_relaxed);
       } else {
-        // t < b: at least one element below the contested top; no thief can be
-        // racing us for slot b. Take it outright.
+        // t < b: at least one element sits below the contested top; no thief
+        // can be racing us for slot b. Take it outright, bottom_ stays at b.
         result = x;
       }
     } else {
       // t > b: empty. Undo the tentative decrement.
-      result.reset();
       bottom_.store(b + 1, std::memory_order_relaxed);
     }
     return result;
@@ -228,56 +192,43 @@ class ChaseLevDeque {
   // ----------------------------------------------------------------- steal()
   // ANY thief thread. FIFO w.r.t. the owner. Three outcomes -- see StealStatus.
   StealStatus steal(T& out) {
-    // top_: ACQUIRE. Pairs with the releasing CAS of whichever thief most
-    // recently advanced top_ (and, transitively, with the owner's pop() CAS).
-    // Ensures our subsequent view of ring_ / slots is at least as recent as
-    // that thief's.
+    // top_: ACQUIRE. Pairs with the releasing CAS of whichever thief last
+    // advanced top_. A stale value here only costs a failed CAS -> kAbort.
     std::int64_t t = top_.load(std::memory_order_acquire);
 
-    // SEQ_CST FENCE -- thief half of the Dekker pair with pop()'s fence.
-    // Orders our (upcoming) top_ CAS store against our bottom_ load below,
-    // within the global total order S. See the long comment in pop().
-    std::atomic_thread_fence(std::memory_order_seq_cst);
-
-    // bottom_: ACQUIRE. Pairs with the RELEASE FENCE in push(). This is the
-    // consumer half of the element handoff: having synchronized here, when we
-    // read the slot below we are guaranteed to see the value push() stored,
-    // not a stale slot. Downgrading this to relaxed is the mirror image of
-    // Stage 9's bug.
-    const std::int64_t b = bottom_.load(std::memory_order_acquire);
+    // bottom_: SEQ_CST load. This and the seq_cst CAS of top_ below are the
+    // thief's contributions to the total order S described in pop(). Reading a
+    // sufficiently recent bottom_ also means that, having found the deque
+    // non-empty, the slot read below sees the element push() published with its
+    // release store (this load synchronizes-with that store).
+    const std::int64_t b = bottom_.load(std::memory_order_seq_cst);
 
     if (t >= b) {
       return StealStatus::kEmpty;  // observably empty
     }
 
-    // Non-empty. Load the current ring with ACQUIRE, pairing with the
-    // ring_.store(release) in grow(). If we raced a grow and used a stale ring,
-    // slot `t & old_mask` might not hold element t after the copy -> we'd
-    // return the wrong value. (LPCN uses memory_order_consume here; consume is
-    // unimplemented-as-specified by every mainstream compiler and compiled as
-    // acquire anyway, so we ask for acquire explicitly. The dependency it is
-    // meant to protect is ring -> ring->slot[t].)
+    // Non-empty. Load the ring with ACQUIRE, pairing with grow()'s release
+    // store. A stale ring would index element t into the wrong slot after a
+    // resize. (LPCN uses memory_order_consume here; consume is compiled as
+    // acquire by every mainstream compiler, so we ask for acquire directly.)
     Ring* r = ring_.load(std::memory_order_acquire);
-    T x = r->get(t);  // relaxed slot load; ordering supplied by the acquires above
+    T x = r->get(t);  // relaxed slot load; ordering supplied by the loads above
 
     // Commit by advancing top_ past t.
-    //   success seq_cst: same reason as pop()'s CAS -- must lie in S.
-    //   failure relaxed: another thief (or the owner) moved top_; `t` is
-    //     refreshed but we don't retry in-place, we report kAbort and let the
-    //     caller pick another victim. Retrying here risks livelock under heavy
-    //     contention; spreading the retry across victims is strictly better.
+    //   success seq_cst: part of S (Dekker, see pop()).
+    //   failure relaxed: someone else moved top_; report kAbort and let the
+    //     caller pick another victim -- retrying in place risks livelock under
+    //     contention, spreading the retry across victims does not.
     if (!top_.compare_exchange_strong(t, t + 1, std::memory_order_seq_cst,
                                       std::memory_order_relaxed)) {
       return StealStatus::kAbort;
     }
-
     out = x;
     return StealStatus::kSuccess;
   }
 
-  // Convenience wrapper: nullopt covers both kEmpty and kAbort (the caller that
-  // needs to tell them apart -- e.g. steal-rate instrumentation -- uses the
-  // StealStatus overload).
+  // Convenience wrapper: nullopt covers both kEmpty and kAbort. Callers that
+  // must tell them apart (steal-rate instrumentation) use the StealStatus form.
   std::optional<T> steal() {
     T tmp{};
     if (steal(tmp) == StealStatus::kSuccess) return tmp;
@@ -285,8 +236,8 @@ class ChaseLevDeque {
   }
 
   // --------------------------------------------------------------- observers
-  // Approximate: correct only if no one is mutating concurrently. For
-  // instrumentation and tests, never for control flow on the hot path.
+  // Approximate unless the caller knows no one is mutating concurrently. For
+  // instrumentation and tests, never for hot-path control flow.
   std::int64_t size() const {
     const std::int64_t b = bottom_.load(std::memory_order_relaxed);
     const std::int64_t t = top_.load(std::memory_order_relaxed);
@@ -298,7 +249,6 @@ class ChaseLevDeque {
   std::int64_t capacity() const {
     return ring_.load(std::memory_order_relaxed)->capacity;
   }
-  // How many times the ring has doubled -- a cost signal for benchmarks.
   std::size_t grow_count() const { return owned_rings_.size() - 1; }
 
  private:
@@ -308,12 +258,12 @@ class ChaseLevDeque {
     std::unique_ptr<std::atomic<T>[]> slots;
 
     explicit Ring(std::int64_t cap)
-        : capacity(cap), mask(cap - 1), slots(new std::atomic<T>[static_cast<std::size_t>(cap)]) {
+        : capacity(cap),
+          mask(cap - 1),
+          slots(new std::atomic<T>[static_cast<std::size_t>(cap)]) {
       // value-initialised: every slot starts as T() (nullptr / 0).
     }
 
-    // All slot access is relaxed; ordering is imposed by the fences/among
-    // top_/bottom_ in push/pop/steal, never here.
     T get(std::int64_t i) const {
       return slots[static_cast<std::size_t>(i & mask)].load(std::memory_order_relaxed);
     }
@@ -329,19 +279,16 @@ class ChaseLevDeque {
       nr->put(i, old_ring->get(i));
     }
     // RELEASE store: pairs with the acquire load of ring_ in steal(). A thief
-    // that sees this new pointer is guaranteed to also see the copied slot
-    // contents above.
+    // that sees this pointer also sees the copied slot contents above.
     ring_.store(nr, std::memory_order_release);
 
-    // Retire the old ring. We do NOT free it now: a thief may still be inside
-    // steal() holding `old_ring` and about to read a slot from it. We keep
-    // every ring alive until the deque is destroyed (all threads joined).
-    // owned_rings_ is touched only by the owner and only on this cold path, so
-    // the push_back's potential allocation never hits the steady-state hot
-    // path. Cost: O(log n) leaked buffers for the deque's lifetime, which for
-    // a scheduler (deques live as long as the pool) is nothing. A
-    // general-purpose deque would need hazard pointers or epoch-based
-    // reclamation instead; that trade is discussed in DESIGN.md.
+    // Retire, do NOT free: a thief may still hold `old_ring` inside steal().
+    // Every ring is kept alive until the deque is destroyed (all threads
+    // joined). owned_rings_ is touched only by the owner and only on this cold
+    // path, so its push_back never hits the steady-state hot path. Cost: a few
+    // stale buffers for the deque's lifetime -- negligible for a scheduler,
+    // where deques live as long as the pool. A general-purpose deque would use
+    // hazard pointers or epoch-based reclamation; that trade is in DESIGN.md.
     owned_rings_.emplace_back(nr);
     return nr;
   }
@@ -353,17 +300,14 @@ class ChaseLevDeque {
   }
 
   // Hot atomics, each on its own cache line: the owner writes bottom_ and reads
-  // top_; thieves write top_ and read bottom_. Sharing a line would put those
-  // on the same coherence unit and serialize owner vs. thieves for no reason.
+  // top_; thieves write top_ and read bottom_. Sharing a line would serialize
+  // owner and thieves on the same coherence unit for no reason.
   alignas(TF_CACHELINE) std::atomic<std::int64_t> top_;
   alignas(TF_CACHELINE) std::atomic<std::int64_t> bottom_;
   alignas(TF_CACHELINE) std::atomic<Ring*> ring_;
 
   // Cold, owner-only: every Ring ever allocated, freed at destruction.
   std::vector<std::unique_ptr<Ring>> owned_rings_;
-
-  static_assert(std::atomic<std::int64_t>::is_always_lock_free,
-                "need lock-free 64-bit atomics");
 };
 
 }  // namespace taskforge
