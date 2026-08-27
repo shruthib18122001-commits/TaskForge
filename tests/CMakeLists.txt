@@ -22,6 +22,21 @@ endif()
 
 include(GoogleTest)
 
+# Our targets compile with -Wconversion -Wsign-conversion -Wold-style-cast
+# -Werror. GoogleTest's headers do not survive that. Mark its include dirs as
+# SYSTEM so warnings originating inside <gtest/*.h> (incl. macro bodies) are
+# suppressed, while warnings on OUR expressions passed to EXPECT_/ASSERT_ still
+# fire.
+foreach(_gt gtest gtest_main gmock gmock_main)
+  if(TARGET ${_gt})
+    get_target_property(_inc ${_gt} INTERFACE_INCLUDE_DIRECTORIES)
+    if(_inc)
+      set_target_properties(${_gt} PROPERTIES
+        INTERFACE_SYSTEM_INCLUDE_DIRECTORIES "${_inc}")
+    endif()
+  endif()
+endforeach()
+
 add_library(taskforge_test_main INTERFACE)
 target_link_libraries(taskforge_test_main INTERFACE
   taskforge_build_settings
