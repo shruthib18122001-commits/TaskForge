@@ -67,9 +67,10 @@ struct alignas(TF_CACHELINE) WorkerCounters {
   std::uint64_t steals_abort = 0;   // lost the CAS race
   std::uint64_t steals_empty = 0;   // victim had nothing
   std::uint64_t inject_takes = 0;
-  std::uint64_t spin_iters = 0;
-  std::uint64_t yield_iters = 0;
-  std::uint64_t sleeps = 0;
+  std::uint64_t spin_iters = 0;     // PAUSE-spin iterations (proxy for spin time)
+  std::uint64_t yield_iters = 0;    // yield() iterations
+  std::uint64_t sleeps = 0;         // times this worker blocked on the condvar
+  std::uint64_t sleep_ns = 0;       // wall time spent blocked on the condvar
 };
 
 struct PoolStats {
@@ -342,6 +343,7 @@ class ThreadPool {
       // Sleep until woken by a submit / shutdown, or the backstop fires.
       ++w->counters.sleeps;
       {
+        const auto t0 = std::chrono::steady_clock::now();
         std::unique_lock<std::mutex> lk(sleep_mtx_);
         sleep_cv_.wait_for(lk, opt_.sleep_backstop, [this] {
           return done_.load(std::memory_order_acquire) ||
@@ -349,6 +351,10 @@ class ThreadPool {
                  work_hint_.load(std::memory_order_acquire);
         });
         work_hint_.store(false, std::memory_order_relaxed);
+        w->counters.sleep_ns += static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - t0)
+                .count());
       }
       // After waking, drop back to the spin tier so a burst of submits does not
       // pay a full sleep each time.
