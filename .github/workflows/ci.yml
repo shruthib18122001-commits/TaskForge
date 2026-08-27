@@ -98,19 +98,21 @@ jobs:
       - name: Expect a TSan race report (nonzero exit)
         run: |
           set +e
-          TSAN_OPTIONS=halt_on_error=1 ./buggy_demo > demo.out 2>&1
+          TSAN_OPTIONS=halt_on_error=1 TF_BUG_MS=1500 TF_BUG_UNIQUE=3000000 \
+            timeout 120 ./buggy_demo > demo.out 2>&1
           rc=$?
           cat demo.out
           echo "exit code: $rc"
+          if grep -qiE "WARNING: ThreadSanitizer: data race|value-check FAILED" demo.out; then
+            echo "OK: buggy variant tripped as expected"
+            exit 0
+          fi
           if [ $rc -eq 0 ]; then
             echo "::error::buggy deque ran clean under TSan -- the demo is no longer demonstrating the bug"
             exit 1
           fi
-          if ! grep -qiE "WARNING: ThreadSanitizer: data race|value-check FAILED" demo.out; then
-            echo "::error::nonzero exit but no recognizable race/corruption signature"
-            exit 1
-          fi
-          echo "OK: buggy variant tripped as expected"
+          echo "::error::nonzero exit ($rc) but no recognizable race/corruption signature"
+          exit 1
 
   # ---------------------------------------------------------------------------
   # Charting / analysis scripts: syntax-check and smoke-run against a committed

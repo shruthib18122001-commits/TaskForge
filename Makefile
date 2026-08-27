@@ -98,13 +98,24 @@ verify-asan: $(VERIFY_ASAN)
 bench: $(D_DEBUG)/taskforge_bench
 	@echo "built $<"
 
-# Stage 9: this is SUPPOSED to trip TSan (and often to fail its value check on
-# ARM). A clean run here would mean the demo is not demonstrating anything.
-buggy-demo: $(D_TSAN)/verify_buggy_deque
-	@echo "=== deliberately-wrong-ordering demo under TSan ==="
-	@echo "Expect: a ThreadSanitizer data-race report, and/or a value-check abort."
-	-TSAN_OPTIONS="halt_on_error=1" $(D_TSAN)/verify_buggy_deque
-	@echo "(nonzero exit / race report above is the expected outcome)"
+# Stage 9: this deque is SUPPOSED to break. Two demonstrations:
+#   1. normal build  -> on a weak-memory CPU (ARM), the stress value-check fails
+#                       (torn reads / duplicate values). On x86 (TSO) it passes.
+#   2. TSan build    -> a data race is reported on the ring cell, on any arch.
+# A clean result from BOTH would mean the demo has stopped demonstrating.
+# The TSan run is wrapped in a 60s cap: on some arm64 setups the sanitizer's
+# own multi-threaded report path can deadlock (documented in DESIGN.md) -- the
+# Linux CI job is the authoritative TSan check.
+buggy-demo: $(D_DEBUG)/verify_buggy_deque $(D_TSAN)/verify_buggy_deque
+	@echo "=== [1/2] normal build: stress value-check (fails on ARM, passes on x86) ==="
+	-$(D_DEBUG)/verify_buggy_deque
+	@echo
+	@echo "=== [2/2] TSan build: expect a data-race report (60s cap) ==="
+	-TSAN_OPTIONS="halt_on_error=1" TF_BUG_MS=1500 TF_BUG_UNIQUE=3000000 \
+	  /bin/sh -c 'exec $(D_TSAN)/verify_buggy_deque & p=$$!; \
+	    ( sleep 60; kill -9 $$p 2>/dev/null ) & w=$$!; \
+	    wait $$p; rc=$$?; kill $$w 2>/dev/null; exit $$rc'
+	@echo "(a race report and/or nonzero exit above is the expected outcome)"
 
 clean:
 	rm -rf $(BUILD)

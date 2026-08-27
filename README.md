@@ -179,13 +179,22 @@ Apple Silicon's L2 is documented to work in 128-byte pairs for coherence, so
 
 ### The deliberately-wrong ordering (Stage 9)
 
-`chase_lev_deque_relaxed.hpp` drops one release fence in `push`. Result:
+`chase_lev_deque_relaxed.hpp` is the correct deque with **one line changed**:
+`push()` advances `bottom_` with a `relaxed` store instead of a `release` store.
+That store is the only happens-before edge between the element write and a
+thief's element read, so removing it makes the slot handoff a data race. The
+slots are widened to a two-word cell so the effect is easy to see.
 
-- casual single run on x86 — <!-- MEASURE: passes -->
-- `make buggy-demo` (TSan) — <!-- MEASURE: paste the data-race report -->
-- stress run on Apple M5 — <!-- MEASURE: value-check failure / duplicate item -->
+| how it's exercised | result |
+|---|---|
+| single-threaded / light tests | pass — casual testing does not catch it |
+| `-O2` stress, x86-64 (TSO) | passes — x86 never reorders the two stores |
+| `-O2` stress, **Apple M5** | **fails every run** — ~40k duplicate (stale) values per ~12M ops |
+| ThreadSanitizer (Linux x86-64, CI) | **data race reported** on the ring cell |
+| ThreadSanitizer (Apple M5) | detects it, but the arm64 sanitizer runtime deadlocks its own report path under concurrent races — see "what didn't work"; the Linux CI job is authoritative |
 
-Details and the exact diff from the correct version: [DESIGN.md](DESIGN.md#stage-9).
+Run it: `make buggy-demo`. CI job `buggy-ordering-demo` fails if the variant ever
+comes back clean. Full diff and the memory-model argument: [DESIGN.md](DESIGN.md#stage-9-the-deliberately-wrong-ordering).
 
 ### Scaling-limit analysis
 
@@ -229,6 +238,14 @@ Kept as we went; failed experiments are the most credible part of this.
   argument is a single total order over the seq_cst ops), it is what
   crossbeam-deque / Taskflow-style implementations do in practice, and it is
   TSan-clean. Details in [DESIGN.md](DESIGN.md).
+- **ThreadSanitizer's own report path deadlocks on arm64 (Apple M5) under a
+  multi-threaded data race.** Seen twice: the Stage 9 buggy deque under TSan, and
+  (earlier, before it was fixed) an ASan `BUS` pile-up in Stage 3. With several
+  threads hitting the same race/fault at once, the sanitizer runtime appears to
+  wedge in `Die()` / the reporting lock and produces no output. Worked around by
+  keeping sanitized stress harnesses to 1–2 racing threads locally and treating
+  the **Linux x86-64 CI** sanitizer jobs as authoritative. Not a bug in
+  TaskForge, but it shaped how the tests are written.
 - <!-- MEASURE / fill from the log as later stages land: e.g. "round-robin
   victim selection raised failed-steal rate under skew — switched to random" -->
 - <!-- MEASURE: "immediate CV block on empty deque added ~Nµs wake latency to
