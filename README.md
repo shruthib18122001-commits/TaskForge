@@ -157,12 +157,25 @@ steals, and spin time per worker, plotted against load imbalance.
 
 ### False-sharing experiment (Stage 8)
 
-| layout | throughput (tasks/s) | cache-misses (`perf`) |
-|---|---|---|
-| packed per-worker counters | <!-- MEASURE --> | <!-- MEASURE --> |
-| `alignas(64)` per-worker counters | <!-- MEASURE --> | <!-- MEASURE --> |
+`include/taskforge/false_sharing.hpp` isolates the per-worker counter update the
+pool does on every task, and runs it two ways while sweeping thread count:
+`PackedSlot` (8-byte atomics, no alignment — up to 8 pack into one cache line)
+vs `AlignedSlot` (`alignas(64)`, one line each).
 
-<!-- MEASURE: note the Apple Silicon 128-byte effective line and whether alignas(128) mattered -->
+Dev machine (Apple M5, 10 cores), 200M increments/thread, `median_ms`:
+
+| threads | packed | aligned | packed ×slower |
+|--:|--:|--:|--:|
+| 1 | 32 ms | 31 ms | 1.0× |
+| 2 | 213 ms | 32 ms | 6.7× |
+| 4 | 667 ms | 33 ms | 20× |
+| 8 | 3133 ms | 65 ms | 48× |
+
+Linux / `perf` cache-miss counts: <!-- MEASURE: scripts/run_perf.sh false-sharing -->.
+Apple Silicon's L2 is documented to work in 128-byte pairs for coherence, so
+`-DTF_CACHELINE=128` is worth a sweep on both machines — <!-- MEASURE: rerun with
+128 and compare -->. The pool uses `alignas(TF_CACHELINE)` (64 by default) on
+`WorkerCounters` for exactly this reason.
 
 ### The deliberately-wrong ordering (Stage 9)
 

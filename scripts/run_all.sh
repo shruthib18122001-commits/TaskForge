@@ -41,9 +41,11 @@ run scaling     --bench scaling     --pool all --task-us 8 --tasks 200000
 run imbalanced  --bench imbalanced  --pool all --task-us 20 --tasks 100000 --imbalance 32
 run dag         --bench dag         --pool all
 run steal_rate  --bench steal-rate
+run false_sharing --bench false-sharing
 
 echo
 echo "done. regenerate figures:"
 echo "  python scripts/plot_scaling.py       --csv $OUT/scaling.csv       --out results/charts/scaling.png"
 echo "  python scripts/plot_granularity.py   --csv $OUT/granularity.csv   --out results/charts/granularity.png"
 echo "  python scripts/plot_steal_rate.py    --csv $OUT/steal_rate.csv    --out results/charts/steal_rate.png"
+echo "  python scripts/plot_false_sharing.py --csv $OUT/false_sharing.csv --out results/charts/false_sharing.png"

@@ -20,6 +20,7 @@
 #include "workload.hpp"
 
 #include "taskforge/async_pool.hpp"
+#include "taskforge/false_sharing.hpp"
 #include "taskforge/mutex_queue_pool.hpp"
 #include "taskforge/thread_pool.hpp"
 
@@ -341,6 +342,46 @@ void bench_steal_rate(const Args& a, std::FILE* out) {
   }
 }
 
+// -------------------------------------------------------------------------
+// Stage 8: the false-sharing experiment. Same counter-hammer workload, once
+// with packed per-thread slots (sharing cache lines) and once with
+// alignas(64) slots, sweeping thread count. Own schema with a `layout` column.
+// On Linux, scripts/run_perf.sh wraps this to add cache-miss counts.
+// -------------------------------------------------------------------------
+void bench_false_sharing(const Args& a, std::FILE* out) {
+  const std::uint64_t iters = a.tasks ? static_cast<std::uint64_t>(a.tasks)
+                                      : 200000000ULL;  // per thread
+  const int reps = a.reps > 0 ? a.reps : 7;
+  const int warmup = a.warmup >= 0 ? a.warmup : 2;
+
+  if (a.header) {
+    std::fprintf(out,
+                 "bench,layout,threads,iters_per_thread,reps,"
+                 "median_ms,mean_ms,p95_ms,stddev_ms,throughput_incr_per_s\n");
+  }
+
+  for (unsigned t = 1; t <= hw(); ++t) {
+    for (taskforge::FsLayout layout :
+         {taskforge::FsLayout::kPacked, taskforge::FsLayout::kAligned}) {
+      std::vector<double> kept;
+      for (int r = 0; r < reps + warmup; ++r) {
+        const double sec = taskforge::run_false_sharing(layout, t, iters);
+        if (r >= warmup) kept.push_back(sec * 1000.0);
+      }
+      const Summary s = Summary::of(kept);
+      const double thru =
+          s.median_ms > 0
+              ? static_cast<double>(t) * static_cast<double>(iters) / (s.median_ms / 1000.0)
+              : 0.0;
+      std::fprintf(out, "false-sharing,%s,%u,%llu,%zu,%.4f,%.4f,%.4f,%.4f,%.1f\n",
+                   layout == taskforge::FsLayout::kPacked ? "packed" : "aligned",
+                   t, static_cast<unsigned long long>(iters), s.reps, s.median_ms,
+                   s.mean_ms, s.p95_ms, s.stddev_ms, thru);
+      std::fflush(out);
+    }
+  }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -354,6 +395,11 @@ int main(int argc, char** argv) {
 
   if (a.bench == "steal-rate") {
     bench_steal_rate(a, out);
+    if (out != stdout) std::fclose(out);
+    return 0;
+  }
+  if (a.bench == "false-sharing") {
+    bench_false_sharing(a, out);
     if (out != stdout) std::fclose(out);
     return 0;
   }

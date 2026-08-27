@@ -21,32 +21,47 @@ def main():
         raise SystemExit("CSV needs a 'layout' column; run "
                          "`taskforge_bench --bench false-sharing`")
 
+    thru_col = ("throughput_incr_per_s" if "throughput_incr_per_s" in df.columns
+                else "throughput_tasks_per_s")
     have_misses = "cache_misses" in df.columns
-    ncols = 2 if have_misses else 1
-    fig, axes = plt.subplots(1, ncols, figsize=(5.5 * ncols, 4.5), squeeze=False)
-    ax = axes[0][0]
+    ncols = 3 if have_misses else 2
+    fig, axes = plt.subplots(1, ncols, figsize=(5.0 * ncols, 4.4), squeeze=False)
+    ax, ax_ratio = axes[0][0], axes[0][1]
 
     for layout, style in (("packed", dict(marker="o")),
                           ("aligned", dict(marker="s"))):
         d = df[df["layout"] == layout].sort_values("threads")
         if d.empty:
             continue
-        ax.plot(d["threads"], d["throughput_tasks_per_s"] / 1e6, label=layout, **style)
-    ax.set_xlabel("worker threads")
-    ax.set_ylabel("throughput (M tasks/s)")
+        ax.plot(d["threads"], d[thru_col] / 1e6, label=layout, **style)
+    ax.set_xlabel("threads")
+    ax.set_ylabel("increments/s (millions)")
     ax.set_title("Throughput: packed vs alignas(64)")
     ax.legend()
     ax.grid(alpha=0.3)
 
+    # Slowdown factor: how many times slower the packed layout is.
+    p = df[df["layout"] == "packed"].set_index("threads")["median_ms"]
+    a = df[df["layout"] == "aligned"].set_index("threads")["median_ms"]
+    both = p.to_frame("packed").join(a.to_frame("aligned")).dropna()
+    if not both.empty:
+        ax_ratio.plot(both.index, both["packed"] / both["aligned"], marker="o",
+                      color="C3")
+        ax_ratio.axhline(1.0, ls="--", color="grey")
+        ax_ratio.set_xlabel("threads")
+        ax_ratio.set_ylabel("packed / aligned  (x slower)")
+        ax_ratio.set_title("False-sharing penalty")
+        ax_ratio.grid(alpha=0.3)
+
     if have_misses:
-        ax2 = axes[0][1]
+        ax2 = axes[0][2]
         for layout, style in (("packed", dict(marker="o")),
                               ("aligned", dict(marker="s"))):
             d = df[df["layout"] == layout].sort_values("threads")
             if d.empty:
                 continue
             ax2.plot(d["threads"], d["cache_misses"], label=layout, **style)
-        ax2.set_xlabel("worker threads")
+        ax2.set_xlabel("threads")
         ax2.set_ylabel("cache misses (perf)")
         ax2.set_title("Cache misses")
         ax2.legend()

@@ -71,6 +71,9 @@ tf_add_test(test_dag_cycle         SOURCES test_dag_cycle.cpp)
 # ---- Stage 7: steal-rate instrumentation ---------------------------
 tf_add_test(test_steal_stats       SOURCES test_steal_stats.cpp)
 
+# ---- Stage 8: false-sharing experiment ----------------------------
+tf_add_test(test_false_sharing     SOURCES test_false_sharing.cpp)
+
 # ---- Stage 9: the deliberately-wrong deque -------------------------
 # A value-check stress harness for the relaxed variant. NOT expected to be
 # sanitizer-clean; that is the demonstration. Labelled so the default CI run
