@@ -19,7 +19,17 @@ class PoolContract : public ::testing::Test {};
 
 using PoolTypes = ::testing::Types<taskforge::ThreadPool, taskforge::MutexQueuePool,
                                    taskforge::AsyncPool>;
+// GoogleTest's TYPED_TEST_SUITE takes an optional 3rd (name-generator) arg;
+// omitting it leaves __VA_ARGS__ empty, which -Wpedantic flags as a C++20
+// extension under -std=c++17. GoogleTest's macro, not our code.
+#if defined(__clang__) || defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wpedantic"
+#endif
 TYPED_TEST_SUITE(PoolContract, PoolTypes);
+#if defined(__clang__) || defined(__GNUC__)
+#pragma GCC diagnostic pop
+#endif
 
 // AsyncPool spawns a thread per task; keep its counts modest.
 namespace {

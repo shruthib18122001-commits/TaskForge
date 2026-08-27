@@ -55,11 +55,13 @@ function(tf_add_test name)
   if(ARG_LABELS)
     set(_labels "${ARG_LABELS}")
   endif()
+  # Sanitizer runtime options are set by the caller's environment (the CI
+  # workflow sets ASAN_OPTIONS=detect_leaks=1:... on Linux; macOS ASan does not
+  # support detect_leaks and *aborts* if asked, so we must not bake it in here).
   gtest_discover_tests(${name}
     PROPERTIES
       TIMEOUT 600
       LABELS "${_labels}"
-      ENVIRONMENT "TSAN_OPTIONS=halt_on_error=1;ASAN_OPTIONS=detect_leaks=1:abort_on_error=1"
     DISCOVERY_TIMEOUT 60)
 endfunction()
 

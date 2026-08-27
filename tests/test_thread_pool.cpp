@@ -109,10 +109,16 @@ TEST(ThreadPool, StatsAccountForAllExecutedTasks) {
   ASSERT_EQ(s.per_worker.size(), 4u);
   EXPECT_EQ(s.total(&taskforge::WorkerCounters::tasks_executed),
             static_cast<std::uint64_t>(n));
-  // Under a single external producer, at least some work should have been
-  // spread by stealing (not a hard guarantee of scheduling, but overwhelmingly
-  // likely for 50k tasks across 4 workers fed from one thread).
-  EXPECT_GT(s.total(&taskforge::WorkerCounters::steals_success), 0u);
+  // Independent tasks from a single EXTERNAL producer all go through the
+  // injection queue (Chase-Lev forbids a second writer on a worker's deque),
+  // so they are taken via inject_takes, not stolen. This is the "flat workload
+  // bypasses the deques" property -- steal-driven balancing is exercised by
+  // test_steal_stats.cpp's fork-join / seeded-on-one-worker cases instead.
+  EXPECT_GT(s.total(&taskforge::WorkerCounters::inject_takes), 0u);
+  EXPECT_EQ(s.total(&taskforge::WorkerCounters::own_pops) +
+                s.total(&taskforge::WorkerCounters::steals_success) +
+                s.total(&taskforge::WorkerCounters::inject_takes),
+            static_cast<std::uint64_t>(n));
 }
 
 TEST(ThreadPool, SingleThreadDegenerateCase) {
