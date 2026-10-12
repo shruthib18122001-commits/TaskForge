@@ -28,6 +28,15 @@ using taskforge::ChaseLevDequeRelaxed;
 using taskforge::StealStatus;
 using clk = std::chrono::steady_clock;
 
+// x86-64 is TSO: the stress harness below is dead code there (see the TEST),
+// and a function that is defined but never called trips -Wunused-function
+// under -Werror on GCC/Clang. Give it the same platform guard as its only
+// caller so definition and use stay in sync instead of drifting apart again.
+#if !defined(__x86_64__) && !defined(_M_X64)
+#define TF_RELAXED_DEMO_WEAK_MEMORY 1
+#endif
+
+#ifdef TF_RELAXED_DEMO_WEAK_MEMORY
 namespace {
 
 struct StressResult {
@@ -89,6 +98,7 @@ StressResult stress_relaxed_deque(int budget_ms, long long unique) {
 }
 
 }  // namespace
+#endif  // TF_RELAXED_DEMO_WEAK_MEMORY
 
 TEST(RelaxedDequeDemo, SingleThreadedItStillLooksFine) {
   // The missing release only matters across threads. Alone, it is a normal
@@ -105,7 +115,7 @@ TEST(RelaxedDequeDemo, SingleThreadedItStillLooksFine) {
 }
 
 TEST(RelaxedDequeDemo, ConcurrentStressCorruptsOnWeakMemory) {
-#if defined(__x86_64__) || defined(_M_X64)
+#ifndef TF_RELAXED_DEMO_WEAK_MEMORY
   GTEST_SKIP() << "x86-64 is TSO; the stress stays clean here. The check on "
                   "this arch is ThreadSanitizer -- see `make buggy-demo`.";
 #else
