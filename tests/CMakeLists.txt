@@ -97,3 +97,8 @@ tf_add_test(test_false_sharing     SOURCES test_false_sharing.cpp)
 # skips it (`-LE buggy-demo`); run explicitly with `ctest -L buggy-demo`.
 tf_add_test(test_relaxed_deque_demo SOURCES test_relaxed_deque_demo.cpp
   LABELS "buggy-demo")
+
+# ---- Phase 2 / P2-1: numerical core (rng.hpp, black_scholes.hpp) ----
+tf_add_test(test_risk_black_scholes SOURCES test_risk_black_scholes.cpp)
+tf_add_test(test_risk_rng           SOURCES test_risk_rng.cpp)
+tf_add_test(test_risk_montecarlo    SOURCES test_risk_montecarlo.cpp)
