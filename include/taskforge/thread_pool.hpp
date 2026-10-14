@@ -55,12 +55,11 @@
 
 namespace taskforge {
 
-// Per-worker instrumentation. Written only by the owning worker thread (plain
-// stores, no atomics on the hot path); safe to read once the pool is quiescent
-// (after wait_idle() or in the destructor). Stage 7 layers a live relaxed-atomic
-// snapshot on top of this. alignas keeps each worker's block on its own cache
-// line -- Stage 8 deliberately removes that alignment to measure false sharing.
-struct alignas(TF_CACHELINE) WorkerCounters {
+// Per-worker instrumentation, PLAIN snapshot: what stats() hands back. Every
+// field is a point-in-time copy (see WorkerCountersLive below for the live
+// counters it is copied from), so this type is an ordinary copyable POD and
+// costs nothing extra to store in PoolStats::per_worker.
+struct WorkerCounters {
   std::uint64_t tasks_executed = 0;
   std::uint64_t own_pops = 0;
   std::uint64_t steals_success = 0;
@@ -71,6 +70,51 @@ struct alignas(TF_CACHELINE) WorkerCounters {
   std::uint64_t yield_iters = 0;    // yield() iterations
   std::uint64_t sleeps = 0;         // times this worker blocked on the condvar
   std::uint64_t sleep_ns = 0;       // wall time spent blocked on the condvar
+};
+
+// The LIVE counters, one block per worker, mutated only by the owning worker
+// thread. A worker keeps touching these for as long as it is alive -- not just
+// while running tasks: every failed steal attempt, spin iteration, and sleep in
+// the idle backoff loop (worker_main) increments one of them too. So
+// pool.wait_idle() returning (pending_ == 0) does NOT mean these have gone
+// quiet; a worker with nothing left to do is still spinning through
+// acquire_task() and bumping steals_empty / spin_iters on every pass. stats()
+// can therefore be called at any time while the pool is alive -- that is
+// exactly why these are atomics (relaxed: the fields are independent counters,
+// not a consistent multi-field snapshot, so there is nothing stronger to buy).
+// A plain (non-atomic) field here, read concurrently by stats() while a worker
+// is mid-backoff, is a real data race (caught by TSan on Linux x86-64 in the
+// very first CI run -- the earlier version of this comment, which claimed
+// reading after wait_idle() was safe, was simply wrong).
+//
+// alignas keeps each worker's block on its own cache line -- Stage 8
+// deliberately removes that alignment to measure false sharing.
+struct alignas(TF_CACHELINE) WorkerCountersLive {
+  std::atomic<std::uint64_t> tasks_executed{0};
+  std::atomic<std::uint64_t> own_pops{0};
+  std::atomic<std::uint64_t> steals_success{0};
+  std::atomic<std::uint64_t> steals_abort{0};
+  std::atomic<std::uint64_t> steals_empty{0};
+  std::atomic<std::uint64_t> inject_takes{0};
+  std::atomic<std::uint64_t> spin_iters{0};
+  std::atomic<std::uint64_t> yield_iters{0};
+  std::atomic<std::uint64_t> sleeps{0};
+  std::atomic<std::uint64_t> sleep_ns{0};
+
+  WorkerCounters snapshot() const {
+    WorkerCounters s;
+    s.tasks_executed = tasks_executed.load(std::memory_order_relaxed);
+    s.own_pops = own_pops.load(std::memory_order_relaxed);
+    s.steals_success = steals_success.load(std::memory_order_relaxed);
+    s.steals_abort = steals_abort.load(std::memory_order_relaxed);
+    s.steals_empty = steals_empty.load(std::memory_order_relaxed);
+    s.inject_takes = inject_takes.load(std::memory_order_relaxed);
+    s.spin_iters = spin_iters.load(std::memory_order_relaxed);
+    s.yield_iters = yield_iters.load(std::memory_order_relaxed);
+    s.sleeps = sleeps.load(std::memory_order_relaxed);
+    s.sleep_ns = sleep_ns.load(std::memory_order_relaxed);
+    return s;
+  }
 };
 
 struct PoolStats {
@@ -184,11 +228,14 @@ class ThreadPool {
   }
   std::int64_t pending() const { return pending_.load(std::memory_order_relaxed); }
 
-  // Valid once quiescent (after wait_idle()) or after shutdown().
+  // Safe to call at any time, including while the pool is still running --
+  // each field is an independent relaxed-atomic snapshot (see
+  // WorkerCountersLive). The whole struct is not a consistent instant in time
+  // across fields; for that, call after shutdown()/destruction.
   PoolStats stats() const {
     PoolStats s;
     s.per_worker.reserve(n_);
-    for (auto& w : workers_) s.per_worker.push_back(w->counters);
+    for (auto& w : workers_) s.per_worker.push_back(w->counters.snapshot());
     return s;
   }
 
@@ -205,7 +252,7 @@ class ThreadPool {
     ChaseLevDeque<Task*> deque;
     std::thread thread;
     std::minstd_rand rng;
-    WorkerCounters counters;
+    WorkerCountersLive counters;
   };
 
   // Thread-locals: which pool/worker is the calling thread, if it is one of
@@ -240,7 +287,7 @@ class ThreadPool {
   // Own deque, then a bounded random-victim steal sweep, then injection queue.
   Task* acquire_task(Worker* w) {
     if (auto v = w->deque.pop()) {
-      ++w->counters.own_pops;
+      w->counters.own_pops.fetch_add(1, std::memory_order_relaxed);
       return *v;
     }
     // Random victim selection. Round-robin would march every idle thief across
@@ -254,19 +301,19 @@ class ThreadPool {
         Task* out = nullptr;
         switch (workers_[v]->deque.steal(out)) {
           case StealStatus::kSuccess:
-            ++w->counters.steals_success;
+            w->counters.steals_success.fetch_add(1, std::memory_order_relaxed);
             return out;
           case StealStatus::kAbort:
-            ++w->counters.steals_abort;
+            w->counters.steals_abort.fetch_add(1, std::memory_order_relaxed);
             break;  // try another victim rather than retry in place
           case StealStatus::kEmpty:
-            ++w->counters.steals_empty;
+            w->counters.steals_empty.fetch_add(1, std::memory_order_relaxed);
             break;
         }
       }
     }
     if (Task* t = take_injected()) {
-      ++w->counters.inject_takes;
+      w->counters.inject_takes.fetch_add(1, std::memory_order_relaxed);
       return t;
     }
     return nullptr;
@@ -299,7 +346,7 @@ class ThreadPool {
       std::lock_guard<std::mutex> g(exc_mtx_);
       if (!first_exc_) first_exc_ = std::current_exception();
     }
-    if (w) ++w->counters.tasks_executed;
+    if (w) w->counters.tasks_executed.fetch_add(1, std::memory_order_relaxed);
 
     // Completion accounting. acq_rel so the decrement that reaches zero
     // happens-after every child increment this task made (children bump
@@ -330,18 +377,18 @@ class ThreadPool {
 
       ++fails;
       if (fails <= opt_.spin_iters) {
-        ++w->counters.spin_iters;
+        w->counters.spin_iters.fetch_add(1, std::memory_order_relaxed);
         cpu_relax();
         continue;
       }
       if (fails <= opt_.spin_iters + opt_.yield_iters) {
-        ++w->counters.yield_iters;
+        w->counters.yield_iters.fetch_add(1, std::memory_order_relaxed);
         std::this_thread::yield();
         continue;
       }
 
       // Sleep until woken by a submit / shutdown, or the backstop fires.
-      ++w->counters.sleeps;
+      w->counters.sleeps.fetch_add(1, std::memory_order_relaxed);
       {
         const auto t0 = std::chrono::steady_clock::now();
         std::unique_lock<std::mutex> lk(sleep_mtx_);
@@ -351,10 +398,11 @@ class ThreadPool {
                  work_hint_.load(std::memory_order_acquire);
         });
         work_hint_.store(false, std::memory_order_relaxed);
-        w->counters.sleep_ns += static_cast<std::uint64_t>(
+        const auto slept_ns = static_cast<std::uint64_t>(
             std::chrono::duration_cast<std::chrono::nanoseconds>(
                 std::chrono::steady_clock::now() - t0)
                 .count());
+        w->counters.sleep_ns.fetch_add(slept_ns, std::memory_order_relaxed);
       }
       // After waking, drop back to the spin tier so a burst of submits does not
       // pay a full sleep each time.
