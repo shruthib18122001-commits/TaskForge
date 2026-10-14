@@ -83,6 +83,20 @@ class MutexQueuePool {
 
   void shutdown() {
     if (done_.exchange(true, std::memory_order_acq_rel)) return;
+    // Lost-wakeup fence: q_cv_.wait(lk, pred) in worker_main() re-checks its
+    // predicate (which reads done_/drop_) only while holding q_mtx_, and only
+    // transitions into the OS-level wait atomically with releasing q_mtx_. If
+    // we set done_ and notify_all() without ever touching q_mtx_, a worker
+    // that is between "predicate read false" and "finished registering as a
+    // waiter" sees neither the new done_ value nor this notify -- q_cv_ has no
+    // timeout, so it then blocks forever. Taking q_mtx_ here, after done_ is
+    // already set, forces that worker's critical section to fully finish
+    // first (predicate now correctly observes done_ == true, no wait at all)
+    // or fully start first (now a genuine registered waiter, so notify_all()
+    // reaches it) -- the dangerous middle window can't overlap with ours.
+    // Reproduced without this: a tight construct/shutdown loop under TSan
+    // hung after ~18k iterations.
+    { std::lock_guard<std::mutex> g(q_mtx_); }
     q_cv_.notify_all();
     for (auto& t : workers_)
       if (t.joinable()) t.join();

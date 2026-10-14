@@ -277,6 +277,22 @@ tasks, and says so.
 
 Kept as we went; failed experiments are the most credible part of this.
 
+- **`MutexQueuePool::shutdown()` had a textbook lost-wakeup race.** It set
+  `done_` and called `q_cv_.notify_all()` without ever touching `q_mtx_`. A
+  worker inside `q_cv_.wait(lk, pred)` re-checks its predicate only while
+  holding `q_mtx_`, and only transitions into the OS-level wait atomically
+  with releasing it — so a worker caught between "predicate read `false`" and
+  "finished registering as a waiter" could see neither the new `done_` nor the
+  notify. `q_cv_.wait` has no timeout (unlike `ThreadPool`'s sleep, which has a
+  500µs backstop for exactly this reason), so a missed wakeup there hangs
+  forever. Caught by Linux CI (`ci-tsan`, both gcc and clang) as a 600s test
+  timeout on `PoolContract.SubmitAfterShutdownThrows<MutexQueuePool>` —
+  `macos-arm` CI and every local Apple Silicon run passed, so this was a real,
+  rare, timing-dependent race, not flakiness: a tight construct/shutdown loop
+  reproduced it locally after ~18k iterations under TSan. Fix: take and
+  release `q_mtx_` once, after `done_` is set, before `notify_all()` — the
+  same fence `ThreadPool::shutdown()` already used. 150k iterations clean
+  after the fix.
 - **Standalone `std::atomic_thread_fence` (the textbook LPCN formulation).** The
   deque first followed LPCN literally: a `release` fence in `push()` and
   `seq_cst` fences separating the owner's and thief's last-element accesses.
