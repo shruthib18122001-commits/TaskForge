@@ -106,3 +106,6 @@ tf_add_test(test_risk_montecarlo    SOURCES test_risk_montecarlo.cpp)
 # ---- Phase 2 / P2-2: serial reference engine (portfolio.hpp, engine.hpp) ----
 tf_add_test(test_risk_portfolio     SOURCES test_risk_portfolio.cpp)
 tf_add_test(test_risk_engine        SOURCES test_risk_engine.cpp)
+
+# ---- Phase 2 / P2-3: parallel engine (ThreadPool, MutexQueuePool, AsyncPool) ----
+tf_add_test(test_risk_engine_parallel SOURCES test_risk_engine_parallel.cpp)

@@ -30,6 +30,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <exception>
 #include <stdexcept>
 #include <vector>
 
@@ -169,6 +170,63 @@ inline std::vector<double> run_serial(const Portfolio& portfolio, const Scenario
   std::vector<double> losses(static_cast<std::size_t>(params.n_scenarios));
   simulate_chunk(portfolio, base, params, 0, params.n_scenarios, chunk_seed(params.seed, 0),
                 params.n_scenarios > 0 ? losses.data() : nullptr);
+  return losses;
+}
+
+// ---------------------------------------------------------------------------
+// P2-3: the parallel engine.
+//
+// plan_chunks() is the ONLY thing that decides how [0, n_scenarios) is split
+// and seeded, and it depends only on ScenarioParams -- never on thread count
+// or pool type. That is what makes run_parallel()'s result deterministic
+// across both: the SET of (range, seed) pairs submitted as tasks is fixed in
+// advance; only which worker executes which chunk, and in what order, varies
+// with thread count and pool. Each chunk writes to a disjoint
+// [lo, hi) slice of the preallocated `losses` array, so concurrently-running
+// chunks need no synchronization with each other -- the result is the
+// pointwise union of fixed, independent writes, and summing/sorting that
+// array afterwards does not care what order they happened in. See
+// DESIGN.md's Phase 2 section for the full happens-before argument (pool
+// wait_idle() is what makes every chunk's writes visible to the thread that
+// reads `losses` afterwards).
+// ---------------------------------------------------------------------------
+struct ChunkPlan {
+  std::int64_t lo, hi;
+  std::uint64_t seed;
+};
+
+inline std::vector<ChunkPlan> plan_chunks(const ScenarioParams& params) {
+  std::vector<ChunkPlan> plan;
+  const std::int64_t chunk_size = params.chunk_size > 0 ? params.chunk_size : params.n_scenarios;
+  std::uint64_t idx = 0;
+  for (std::int64_t lo = 0; lo < params.n_scenarios; lo += chunk_size) {
+    const std::int64_t hi = std::min(lo + chunk_size, params.n_scenarios);
+    plan.push_back(ChunkPlan{lo, hi, chunk_seed(params.seed, idx)});
+    ++idx;
+  }
+  return plan;
+}
+
+// Templated on Pool so ThreadPool, MutexQueuePool, and AsyncPool all run
+// through this exact same code (only how they schedule the submitted tasks
+// differs). Pool must satisfy the common contract all three already share:
+// submit(F&&), wait_idle(), first_exception() (see thread_pool.hpp's header
+// comment for the full contract). engine.hpp does not include any pool
+// header -- it only needs that contract, not a concrete pool type.
+template <class Pool>
+std::vector<double> run_parallel(Pool& pool, const Portfolio& portfolio,
+                                 const ScenarioParams& params) {
+  const PositionBaseValues base = compute_base_values(portfolio);
+  std::vector<double> losses(static_cast<std::size_t>(params.n_scenarios));
+  double* const data = losses.data();
+
+  for (const ChunkPlan& c : plan_chunks(params)) {
+    pool.submit([&portfolio, &base, &params, c, data] {
+      simulate_chunk(portfolio, base, params, c.lo, c.hi, c.seed, data);
+    });
+  }
+  pool.wait_idle();
+  if (std::exception_ptr e = pool.first_exception()) std::rethrow_exception(e);
   return losses;
 }
 
