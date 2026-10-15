@@ -22,6 +22,7 @@
 
 #pragma once
 
+#include "taskforge/dag.hpp"
 #include "taskforge/risk/black_scholes.hpp"
 #include "taskforge/risk/portfolio.hpp"
 #include "taskforge/risk/rng.hpp"
@@ -325,6 +326,103 @@ inline QuantileResult delta_normal_var_es(const Portfolio& portfolio, double hor
   // sigma * phi(z_alpha) / (1 - alpha).
   r.es = sigma_pnl * norm_pdf(z) / (1.0 - alpha);
   return r;
+}
+
+// ---------------------------------------------------------------------------
+// P2-4: the DAG version.
+//
+// Graph shape, per the spec: one CHUNK node per planned chunk (same
+// plan_chunks() as P2-3 -- the chunk plan still depends only on
+// ScenarioParams, not on this being a DAG run), each writing its [lo, hi)
+// slice of BOTH the firm-level losses array and every desk's loss array
+// (desk d's loss is -desk_pnl[d]; firm loss is their sum -- simulate_chunk
+// already computes both in the same per-scenario pass, see its comment).
+// Then one QUANTILE node per desk plus one firm-level quantile node, each
+// depending on EVERY chunk node (a desk's VaR/ES needs its loss array
+// complete, which needs every chunk to have written its slice). Finally one
+// REPORT node depending on all the quantile nodes, assembling the result.
+//
+// Why firm VaR is not the sum of desk VaRs (this is the point of running the
+// firm as its own quantile node instead of just adding up the desks'):
+// Expected Shortfall is an AVERAGE over a whole tail region, and for the same
+// scenario set and the same k, the firm's worst-k average is provably <= the
+// sum of each desk's own worst-k average (see
+// FirmEsIsSubadditiveAcrossDesks in test_risk_engine_dag.cpp for the short
+// argument -- it is an argmax-over-subsets inequality, not a simulation
+// artifact, so it holds exactly here, not just approximately). VaR has no
+// such averaging to fall back on: it is the loss at one specific quantile
+// THRESHOLD, picked out by whichever scenarios happen to be worst for the
+// firm -- and the scenarios that are worst for the firm are not generally
+// the same scenarios that are worst for each desk individually (a firm-wide
+// tail event might be driven by desk A's book on one scenario and desk B's
+// on another). Summing each desk's own VaR implicitly assumes their worst
+// cases all happen on the same scenarios (perfect comonotonicity), which is
+// almost never true, so there is no general inequality in either direction
+// between firm VaR and the sum of desk VaRs -- this is the textbook reason
+// risk desks increasingly report ES instead of VaR as a firm-level
+// aggregation measure.
+// ---------------------------------------------------------------------------
+struct DagRiskReport {
+  std::vector<QuantileResult> firm;               // one per requested alpha
+  std::vector<std::vector<QuantileResult>> desks;  // [desk][alpha]
+};
+
+template <class Pool>
+DagRiskReport run_dag(Pool& pool, const Portfolio& portfolio, const ScenarioParams& params,
+                      const std::vector<double>& alphas) {
+  const PositionBaseValues base = compute_base_values(portfolio);
+  const auto n = static_cast<std::size_t>(params.n_scenarios);
+  const std::size_t num_desks = portfolio.num_desks;
+
+  std::vector<double> firm_losses(n);
+  std::vector<std::vector<double>> desk_losses(num_desks, std::vector<double>(n));
+
+  Graph g;
+  std::vector<Graph::NodeId> chunk_nodes;
+  for (const ChunkPlan& c : plan_chunks(params)) {
+    chunk_nodes.push_back(
+        g.add_node([&portfolio, &base, &params, c, &firm_losses, &desk_losses] {
+          simulate_chunk(portfolio, base, params, c.lo, c.hi, c.seed, firm_losses.data(),
+                         &desk_losses);
+        }));
+  }
+
+  DagRiskReport report;
+  report.desks.resize(num_desks);
+
+  const Graph::NodeId firm_node = g.add_node(
+      [&firm_losses, &alphas, &report] {
+        report.firm.resize(alphas.size());
+        for (std::size_t i = 0; i < alphas.size(); ++i) {
+          report.firm[i] = compute_var_es(firm_losses, alphas[i]);
+        }
+      },
+      chunk_nodes);
+
+  std::vector<Graph::NodeId> desk_nodes;
+  for (std::size_t d = 0; d < num_desks; ++d) {
+    desk_nodes.push_back(g.add_node(
+        [&desk_losses, d, &alphas, &report] {
+          report.desks[d].resize(alphas.size());
+          for (std::size_t i = 0; i < alphas.size(); ++i) {
+            report.desks[d][i] = compute_var_es(desk_losses[d], alphas[i]);
+          }
+        },
+        chunk_nodes));
+  }
+
+  std::vector<Graph::NodeId> report_deps = desk_nodes;
+  report_deps.push_back(firm_node);
+  // The report node does no work of its own -- report.firm/report.desks are
+  // already fully written by the nodes above by the time this node's
+  // prerequisites are satisfied. It exists so the graph has a single sink
+  // that genuinely depends on every quantile node, matching the spec's
+  // "a report node depends on those" shape; a real reporting step (CSV/
+  // console output) would go here in P2-5/P2-6.
+  g.add_node([] {}, report_deps);
+
+  g.run(pool);
+  return report;
 }
 
 }  // namespace taskforge::risk

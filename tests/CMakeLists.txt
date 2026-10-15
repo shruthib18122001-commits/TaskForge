@@ -109,3 +109,6 @@ tf_add_test(test_risk_engine        SOURCES test_risk_engine.cpp)
 
 # ---- Phase 2 / P2-3: parallel engine (ThreadPool, MutexQueuePool, AsyncPool) ----
 tf_add_test(test_risk_engine_parallel SOURCES test_risk_engine_parallel.cpp)
+
+# ---- Phase 2 / P2-4: DAG engine (chunk + per-desk/firm quantile + report nodes) ----
+tf_add_test(test_risk_engine_dag    SOURCES test_risk_engine_dag.cpp)
