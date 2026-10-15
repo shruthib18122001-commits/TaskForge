@@ -20,6 +20,7 @@
 using taskforge::risk::BlackScholesInputs;
 using taskforge::risk::black_scholes_greeks;
 using taskforge::risk::black_scholes_price;
+using taskforge::risk::inverse_norm_cdf;
 using taskforge::risk::norm_cdf;
 using taskforge::risk::norm_pdf;
 using taskforge::risk::OptionType;
@@ -206,6 +207,25 @@ TEST(BlackScholes, GammaMatchesSecondDifference) {
       const double analytic = black_scholes_greeks(t, in).gamma;
       EXPECT_NEAR(analytic, fd, 1e-4) << "spot=" << in.spot << " T=" << in.time_to_expiry;
     }
+  }
+}
+
+TEST(BlackScholes, InverseNormCdfKnownQuantiles) {
+  // Standard, widely-tabulated z-scores -- these are the exact two values
+  // delta-normal VaR at 95%/99% will use (engine.hpp).
+  EXPECT_NEAR(inverse_norm_cdf(0.95), 1.6448536269514722, 1e-8);
+  EXPECT_NEAR(inverse_norm_cdf(0.99), 2.3263478740408408, 1e-8);
+  EXPECT_NEAR(inverse_norm_cdf(0.5), 0.0, 1e-8);
+  // Symmetry: z_{1-p} == -z_p.
+  EXPECT_NEAR(inverse_norm_cdf(0.01), -inverse_norm_cdf(0.99), 1e-8);
+}
+
+TEST(BlackScholes, InverseNormCdfRoundTripsThroughNormCdf) {
+  // norm_cdf(inverse_norm_cdf(p)) == p across the low, middle, and high
+  // branches of Acklam's piecewise approximation (the branch boundary is at
+  // p = 0.02425 and its mirror 0.97575).
+  for (double p : {1e-6, 0.001, 0.02, 0.02425, 0.1, 0.5, 0.9, 0.97575, 0.999, 1.0 - 1e-6}) {
+    EXPECT_NEAR(norm_cdf(inverse_norm_cdf(p)), p, 1e-9) << "p=" << p;
   }
 }
 
