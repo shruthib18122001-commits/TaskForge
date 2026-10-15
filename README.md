@@ -273,6 +273,129 @@ tasks, and says so.
 
 ---
 
+## Parallel risk engine
+
+A Monte Carlo Value-at-Risk / Expected Shortfall engine
+(`include/taskforge/risk/`) built on top of everything above: same
+`ThreadPool`/`MutexQueuePool`/`AsyncPool`, same DAG resolver, zero new
+atomics. The point of building it is that it reuses, unmodified, exactly the
+synchronization this project spent Phase 1 proving correct — the
+`wait_idle()`/`pending_` accounting and the DAG's dependency counter are the
+*entire* concurrency story for a workload that looks nothing like a
+benchmark harness (option pricing, correlated random scenarios, risk
+aggregation). The full happens-before argument is in
+[DESIGN.md §13](DESIGN.md#13-phase-2-determinism-of-the-parallel-risk-engine).
+
+### What it does
+
+- **Numerical core** (`rng.hpp`, `black_scholes.hpp`): a deterministic
+  SplitMix64 + Box-Muller normal generator seeded only from
+  `(global_seed, chunk_index)` — never thread id or time — and closed-form
+  Black-Scholes price/Greeks, including a hand-written inverse normal CDF
+  (Acklam's rational approximation) for the delta-normal VaR below.
+- **Portfolio** (`portfolio.hpp`): underlyings, a hand-written Cholesky
+  decomposition (rejects non-positive-definite input rather than producing
+  NaNs — `RiskPortfolio.CholeskyRejectsNonPositiveDefinite`/
+  `CholeskyRejectsRankDeficientMatrix`), and a deterministic correlation-
+  matrix generator that is positive definite by construction (a Gram matrix
+  plus `eps*I`).
+- **Serial, parallel, and DAG engines, one math** (`engine.hpp`):
+  `simulate_chunk()` is the only place the GBM-plus-full-revaluation math
+  lives; `run_serial`, `run_parallel<Pool>`, and `run_dag<Pool>` differ only
+  in how a fixed, pre-planned set of (scenario range, seed) chunks gets
+  executed. `run_parallel`/`run_dag` are templated on pool type, so
+  identical code runs under all three pools.
+
+### Correctness results (measured, this repo, dev box)
+
+- **Full revaluation vs. delta-normal — the reason to build this at all.** A
+  short at-the-money straddle (short 1,000 calls + 1,000 puts, 30-day
+  expiry, 30% vol, 10-day horizon) is close to delta-neutral, so the linear
+  approximation reports almost no risk for it. Full revaluation, which
+  actually reprices the convexity, disagrees sharply:
+
+  | | VaR₉₅ | ES₉₅ |
+  |---|--:|--:|
+  | delta-normal | 404.6 | 507.3 |
+  | full revaluation | 3398.2 | 5131.8 |
+
+  **8.4× understated VaR.** This is the textbook short-gamma failure mode of
+  delta-only risk measures, reproduced from first principles.
+- **Correlation genuinely drives the simulated shocks**, not just the
+  closed-form formulas: two long, same-direction stock positions at ρ=0.9
+  show 1.38× the VaR₉₅ of the same book at ρ=0.0 (2423 → 3341,
+  full-revaluation, not delta-normal) — matching the closed-form prediction
+  (`w₁²+w₂²+2ρw₁w₂` under the two correlations) almost exactly.
+- **Firm Expected Shortfall is subadditive across desks — exactly, not
+  approximately** (see DESIGN.md for why this holds by an argmax-over-subsets
+  argument, not a simulation artifact). A 3-desk, 3-underlying book:
+
+  | | VaR₉₅ | ES₉₅ |
+  |---|--:|--:|
+  | desk 0 | 1775 | 2197 |
+  | desk 1 | 1939 | 2554 |
+  | desk 2 | 550 | 635 |
+  | **sum of desks** | **4265** | **5386** |
+  | **firm** | **2660** | **3379** |
+
+  Firm ES (3379) ≤ sum of desk ES (5386), as proven. Firm VaR (2660) is
+  *also* less than the naive sum here (2660 vs 4265) — real diversification
+  — but that is a property of this book's correlations, not a general
+  guarantee: unlike ES, VaR has no averaging argument to fall back on, so
+  there is no inequality that has to hold between firm VaR and summed desk
+  VaRs in general (`RiskEngineDag.FirmVarIsNotEqualToSumOfDeskVars`,
+  DESIGN.md §13 and `engine.hpp`'s `run_dag` comment).
+- **Bit-identical results across 1/2/4/8 threads and all three pools**, for
+  both the chunked parallel engine and the DAG engine
+  (`RiskEngineParallel.DeterministicAcrossThreadCountsAndPools`,
+  `RiskEngineDag.DagResultDeterministicAcrossThreadCounts`) — asserted as
+  exact equality, not "close enough".
+
+### Benchmark results
+
+<!-- MEASURE: paste results/charts/risk.png and the reference-machine numbers -->
+On the dev box (Apple M5, 10 cores, 200k scenarios, 4-underlying/3-position
+book) the work-stealing and mutex pools scale almost identically — 5.1× and
+5.6× at 10 threads — while `std::async` stays flat at ~1×. The chunk-size
+sweep peaks around 250–5,000 scenarios/chunk (~6×10⁷ paths/sec) and collapses
+at both ends: below ~50 scenarios/chunk, per-chunk scheduling overhead
+dominates; a single chunk covering all 200k scenarios gives every pool
+*identical* throughput regardless of thread count, since there is then
+nothing left to parallelize. Full numbers:
+`results/csv/sample_risk.csv` (run with
+`taskforge_bench --bench risk --n-scenarios 200000`).
+
+> **Work-stealing ≈ mutex here for the same reason as the Phase 1 scaling
+> sweep (see "what didn't work" below): `run_parallel` submits every chunk
+> from the calling thread, not from inside a worker, so every chunk goes
+> through the injection queue regardless of pool.** The Chase-Lev deque's
+> steal path simply isn't exercised by this workload shape — reusing it
+> faithfully reproduced the same finding in a completely different domain,
+> which is itself informative: injection-bound workloads are injection-bound
+> no matter what they compute.
+
+The pricing-book benchmark (`--bench risk-pricing-book`) deliberately mixes
+85% cheap closed-form prices, 10% moderate (price + Greeks), and 5%
+expensive path-dependent Asian-option Monte Carlo prices (no closed form, so
+they're genuinely slow) — 5,000 tasks, submitted through one generator task
+so the steal path *is* exercised this time. Dev box, 10 threads:
+
+| pool | wall time (median) | tasks executed | successful steals |
+|---|--:|--:|--:|
+| work-stealing | 45.35 ms | 5,000 | 4,572 |
+| mutex | 45.07 ms | 5,000 | — (no steal mechanism) |
+
+Despite thousands of real steals correcting real load imbalance, wall time is
+a statistical tie. This connects directly to the Phase 1 granularity-sweep
+finding: work-stealing's advantage lives at the fine-grained end, and even
+the "cheap" tasks here (one Black-Scholes evaluation) are large enough,
+relative to a mutex lock/unlock, that queue contention was never the
+bottleneck — the same crossover the granularity sweep found, reached from
+the opposite direction.
+`results/csv/sample_risk_pricing_book.csv` has the full per-worker data.
+
+---
+
 ## What didn't work
 
 Kept as we went; failed experiments are the most credible part of this.
@@ -332,6 +455,45 @@ Kept as we went; failed experiments are the most credible part of this.
 - <!-- MEASURE: fill from the reference-machine runs, e.g. spin/yield/sleep
   backoff constants — the current 128/64/500µs were picked, not measured -->
 - <!-- MEASURE: TF_CACHELINE 64 vs 128 on Apple Silicon (Stage 8) -->
+- **(Phase 2) A second `.cpp` including `thread_pool.hpp` doesn't link on
+  AppleClang/ld64.** `risk_bench.cpp` was first written as a normal
+  translation unit, like `workload.cpp`. It compiled but failed to link:
+  `duplicate symbol 'thread-local wrapper routine for
+  taskforge::ThreadPool::t_pool_'`. `t_pool_`/`t_worker_` are declared
+  `inline thread_local` at namespace scope — valid C++17 (inline variables
+  are explicitly meant to have the same definition appear in multiple TUs),
+  but this trips a real ld64 limitation with the lazy-initialization
+  "wrapper routine" the compiler generates for `thread_local`, which was
+  simply never exercised before since only `bench_main.cpp` ever included
+  `thread_pool.hpp`. Not a bug in TaskForge's code; worked around (not
+  "fixed", since there's nothing in this repo to fix) by making
+  `risk_bench.hpp` header-only, like the rest of `include/taskforge/` —
+  which is a good reminder of *why* that library is header-only to begin
+  with.
+- **(Phase 2) The pricing-book benchmark's first draft didn't exercise
+  stealing either — same root cause as the Phase 1 entry above, rediscovered.**
+  The first version submitted every task in the book with a flat
+  `for (...) pool.submit(...)` loop from the benchmark's own thread.
+  `steals_success` came back ~0 for the work-stealing pool too: external
+  submits always go through the injection queue (single-writer-per-deque
+  rule), so a flat loop can't show a steal-vs-mutex comparison no matter how
+  uneven the task costs are. Fixed by submitting the whole book through one
+  generator task instead (`submit_book`), landing every leaf task on that
+  one worker's own deque first — `bench_steal_rate`'s existing convention,
+  applied to a new workload, catching the exact same mistake a second time
+  confirms it's a real, easy-to-make error and not a one-off.
+- **(Phase 2) A fixed-fraction-of-spot step size broke
+  `GammaMatchesSecondDifference` on the 1-day-horizon sample input.** Gamma's
+  central second-difference has worse numerical conditioning than a first
+  difference (near-equal-value subtraction, divided by `h²`), so `h` needs to
+  scale with the option's own curvature scale — roughly `S·σ·√T`, the "one
+  standard deviation of spot move" width — not spot alone. `h = 1e-2·spot`
+  is fine when `T=1` but is comparable to (not tiny next to) `S·σ·√T ≈ $1`
+  when `T = 1/365`, so truncation error dominated and the test's error
+  looked like a formula bug. Diagnosed by sweeping `h` relative to
+  `S·σ·√T` across every sample input (`~1e-5..1e-6` relative error at
+  `h = 1e-2·scale`, consistently); fixed by scaling `h` to that quantity
+  instead, with the empirical justification left in the test as a comment.
 
 ---
 

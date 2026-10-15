@@ -134,4 +134,5 @@ jobs:
           python scripts/plot_granularity.py  --csv results/csv/sample_granularity.csv  --out results/charts/_ci_gran.png
           python scripts/plot_steal_rate.py   --csv results/csv/sample_steal_rate.csv   --out results/charts/_ci_steal.png
           python scripts/plot_false_sharing.py --csv results/csv/sample_false_sharing.csv --out results/charts/_ci_fs.png
+          python scripts/plot_risk.py         --csv results/csv/sample_risk.csv         --out results/charts/_ci_risk.png
           python scripts/analyze.py --csv results/csv/sample_scaling.csv --perf-dir /nonexistent --out results/perf/_ci_analysis.md

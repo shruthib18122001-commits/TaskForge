@@ -465,3 +465,116 @@ among locals, or `wait_idle()` before that state goes out of scope. (An earlier
 version of `test_pool_shutdown.cpp` got this wrong and ASan caught the
 use-after-free — the fix is a one-liner and the rule is now in the pool's header
 comment.)
+
+---
+
+## 13. Phase 2: determinism of the parallel risk engine
+
+`include/taskforge/risk/engine.hpp`'s chunk-based simulation is new
+concurrent machinery on top of the Phase 1 primitives above, not a new
+synchronization mechanism — it adds zero atomics of its own. Its correctness
+rests entirely on composing two things already proven in this document: the
+pool's `wait_idle()`/`pending_` accounting (§8) and the DAG's dependency
+counter (§9). This section spells out why that composition gives bit-for-bit
+reproducible results across any thread count and any of the three pools.
+
+### The chunk plan is a pure function, computed before any task runs
+
+```cpp
+inline std::vector<ChunkPlan> plan_chunks(const ScenarioParams& params) {
+  std::vector<ChunkPlan> plan;
+  const std::int64_t chunk_size = params.chunk_size > 0 ? params.chunk_size : params.n_scenarios;
+  std::uint64_t idx = 0;
+  for (std::int64_t lo = 0; lo < params.n_scenarios; lo += chunk_size) {
+    const std::int64_t hi = std::min(lo + chunk_size, params.n_scenarios);
+    plan.push_back(ChunkPlan{lo, hi, chunk_seed(params.seed, idx)});
+    ++idx;
+  }
+  return plan;
+}
+```
+
+`plan_chunks` reads only `ScenarioParams` (`n_scenarios`, `chunk_size`,
+`seed`) — never thread count, never pool type, never anything about the
+machine it's running on. `run_parallel`/`run_dag` call it once, single-
+threaded, before submitting a single task. So the SET of (scenario range,
+seed) triples a run will execute is fixed at the moment the call starts,
+identically regardless of how many workers end up executing it or in what
+order. Everything below only has to show that each chunk's result is
+computed the same way regardless of execution order, and that every chunk's
+result is visible before anything reads the combined array — not that the
+plan itself is somehow derived deterministically, which it trivially is.
+
+### Each chunk writes a disjoint slice; no reduction happens across chunks
+
+`simulate_chunk(portfolio, base, params, lo, hi, seed, firm_losses, desk_losses)`
+writes only `firm_losses[lo..hi)` and, if requested, `(*desk_losses)[d][lo..hi)`
+for every desk `d`. Two chunks' ranges never overlap, so two chunks running
+concurrently touch disjoint memory — the same "disjoint preallocated slice"
+argument the benchmark harness already relies on (P2-0), and for the same
+reason: disjoint writes need no synchronization *between* the writers, only a
+barrier between the writers and whoever reads the combined array afterwards.
+
+This is also why floating-point non-associativity — the concern that
+motivated "reduce chunks in index order" in the original P2-0 chunking
+proposal — turns out not to apply to anything in this engine. There is no
+runtime step that **sums** values written by different chunks. The only
+cross-scenario reduction is `compute_var_es`'s sort-and-pick-the-k-worst,
+which runs single-threaded, after every chunk has finished, over a fixed
+array in a fixed (ascending) order — so it is already deterministic by
+construction, independent of which worker wrote which slice or in what
+order the writes happened. If a future addition needed an actual
+cross-chunk sum (a running total, say), THAT would need the chunk-index-
+ordered-reduction discipline; nothing in P2-2 through P2-4 does.
+
+### Why the reader sees every chunk's writes: two happens-before paths
+
+**`run_parallel` (P2-3).** Each chunk is one `pool.submit(...)` call; the
+caller reads `losses` only after `pool.wait_idle()` returns. §8's
+`pending_` argument applies directly: `enqueue()` does
+`pending_.fetch_add(1, acq_rel)` before a task can run, `run_task()` does
+`pending_.fetch_sub(1, acq_rel)` after it returns, and `wait_idle()`'s loop
+exits only once it observes `pending_.load(acquire) == 0`. Every chunk's
+`fetch_sub` and every other chunk's `fetch_sub` operate on the *same*
+atomic, so together they form one release sequence (C++17 [intro.races]);
+`wait_idle()`'s single acquire-load synchronizes-with the **last** release in
+that sequence, which — because it is a release **sequence**, not a single
+pairwise release/acquire — carries the happens-before of every earlier
+release in the chain along with it. So by the time `wait_idle()` returns,
+every chunk's `simulate_chunk` writes are visible to the calling thread, no
+matter which worker ran which chunk or in what order they finished.
+
+**`run_dag` (P2-4).** Each chunk is a `Graph` node with no edges in; each
+quantile node (per-desk and firm) has an edge **from every chunk node**. §9's
+argument applies per-edge: a quantile node's `remaining` counter starts at
+the chunk count, and each chunk node's completion does
+`remaining.fetch_sub(1, acq_rel)`. The decrement that observes `1` (bringing
+it to `0`) is an acquire that has observed every other chunk node's release
+— that is what "every predecessor released before the successor can
+acquire" means for a node with N prerequisites, not just two — so the
+quantile node only runs once every chunk's writes to its loss array are
+visible to it. The report node then depends on every quantile node by the
+same argument, one level up.
+
+Both paths reduce to the identical claim: **completion of every chunk
+happens-before the read of the combined array**, just enforced by two
+different counters (`pending_` for the whole pool vs `remaining` per DAG
+node). Neither one depends on execution order, thread count, or which pool
+ran it — which is exactly the property
+`RiskEngineParallel.DeterministicAcrossThreadCountsAndPools` and
+`RiskEngineDag.DagResultDeterministicAcrossThreadCounts` check directly, by
+asserting bit-equality (not "close enough") across 1/2/4/8 threads and all
+three pools.
+
+### What is deliberately NOT claimed
+
+`run_serial` (P2-2) treats the entire scenario range as one chunk (index 0)
+and is not expected to bit-match `run_parallel`/`run_dag` running the same
+`n_scenarios` with `chunk_size < n_scenarios`: different chunk boundaries
+mean different per-chunk seeds covering different sub-ranges, so the
+*sequence* of random draws differs even though every scenario is still drawn
+from a well-seeded, well-separated stream. The three engines are validated
+against each other statistically (same VaR within Monte Carlo standard
+error) and the parallel/DAG engines are validated against each other and
+across themselves bit-exactly — those are the two different claims this
+section and `engine.hpp`'s file header are each careful to keep separate.
