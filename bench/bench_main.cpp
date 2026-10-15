@@ -1,6 +1,7 @@
 // bench_main.cpp -- the benchmark driver.
 //
-//   taskforge_bench --bench <granularity|scaling|imbalanced|dag|steal-rate> [options]
+//   taskforge_bench --bench <granularity|scaling|imbalanced|dag|steal-rate|
+//                            risk|risk-pricing-book> [options]
 //
 // Common options:
 //   --pool <workstealing|mutex|async|all>   (default: all)
@@ -13,10 +14,21 @@
 //   --pin                 pin worker threads (Linux; recorded in CSV)
 //   --out <file>          append CSV here (default: stdout)
 //   --no-header           do not print the CSV header row
+//   --n-scenarios <N>     Monte Carlo scenario count, --bench risk only
+//                         (default: risk_bench.cpp's own default)
+//   --chunk-size <N>      scenarios per chunk, --bench risk only (scaling
+//                         sub-sweep only -- the chunk-size sub-sweep ignores
+//                         this and sweeps chunk size itself)
 //
-// The CSV schema is in bench_common.hpp. Every sweep appends the same columns.
+// The CSV schema for granularity/scaling/imbalanced/dag is in
+// bench_common.hpp; every one of those sweeps appends the same columns.
+// steal-rate, false-sharing, risk, and risk-pricing-book each have their own,
+// different schema (a wall-clock-only schema cannot also carry risk_bench's
+// paths/sec and speedup columns, or steal-rate/risk-pricing-book's one-row-
+// per-worker shape) -- see the header comment above each of those functions.
 
 #include "bench_common.hpp"
+#include "risk_bench.hpp"
 #include "workload.hpp"
 
 #include "taskforge/async_pool.hpp"
@@ -50,11 +62,14 @@ struct Args {
   bool pin = false;
   bool header = true;
   std::string out;
+  std::int64_t n_scenarios = 0;  // --bench risk only; 0 => risk_bench's own default
+  std::int64_t chunk_size = 0;   // --bench risk only; 0 => risk_bench's own default
 };
 
 [[noreturn]] void usage(const char* prog) {
   std::fprintf(stderr,
-               "usage: %s --bench <granularity|scaling|imbalanced|dag|steal-rate> "
+               "usage: %s --bench "
+               "<granularity|scaling|imbalanced|dag|steal-rate|risk|risk-pricing-book> "
                "[options]\nsee the comment block at the top of bench_main.cpp\n",
                prog);
   std::exit(2);
@@ -79,6 +94,8 @@ Args parse(int argc, char** argv) {
     else if (k == "--pin") a.pin = true;
     else if (k == "--no-header") a.header = false;
     else if (k == "--out") a.out = next();
+    else if (k == "--n-scenarios") a.n_scenarios = std::atoll(next().c_str());
+    else if (k == "--chunk-size") a.chunk_size = std::atoll(next().c_str());
     else if (k == "--help" || k == "-h") usage(argv[0]);
     else { std::fprintf(stderr, "unknown arg: %s\n", k.c_str()); usage(argv[0]); }
   }
@@ -400,6 +417,20 @@ int main(int argc, char** argv) {
   }
   if (a.bench == "false-sharing") {
     bench_false_sharing(a, out);
+    if (out != stdout) std::fclose(out);
+    return 0;
+  }
+  if (a.bench == "risk" || a.bench == "risk-pricing-book") {
+    bench::RiskBenchArgs ra;
+    ra.pool = a.pool;
+    ra.reps = a.reps;
+    ra.warmup = a.warmup;
+    ra.n_scenarios = a.n_scenarios;
+    ra.chunk_size = a.chunk_size;
+    ra.n_tasks = a.tasks;
+    ra.pin = a.pin;
+    if (a.bench == "risk") bench::bench_risk_timing(ra, out, a.header);
+    else bench::bench_risk_pricing_book(ra, out, a.header);
     if (out != stdout) std::fclose(out);
     return 0;
   }
